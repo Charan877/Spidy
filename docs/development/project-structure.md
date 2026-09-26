@@ -79,6 +79,7 @@ spidy/
 │   └── spidy.db              # Persistent SQLite database (ignored in git)
 ├── docs/                     # Architecture, development, and testing guides
 │   ├── architecture/         # System design and specifications
+│   ├── assets/               # Screenshots and visual media (spidy-interface.png)
 │   ├── development/          # Setup, workflow, and structure docs
 │   └── testing/              # Test strategy and test execution guides
 ├── scripts/                  # Convenience startup scripts (run.bat, run.ps1)
@@ -90,9 +91,12 @@ spidy/
 ├── app.py                    # Dual launcher (Starlette server / Streamlit fallback)
 ├── server.py                 # Primary backend server entrypoint
 ├── requirements.txt          # Python package requirements
+├── CONTRIBUTING.md           # Contribution guidelines and quick checklist
+├── LICENSE                   # Apache 2.0 open-source license
 ├── .env.example              # Environment variable template
 ├── .gitignore                # Comprehensive Git exclusion rules
-└── README.md                 # Project overview and quickstart guide
+└── README.md                 # Project overview and documentation
+
 ```
 
 ---

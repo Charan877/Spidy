@@ -60,6 +60,14 @@ To prevent cross-project contamination across sequential runs (e.g., LeetCode me
 - **Process Manager (`process_manager.py`)**: Manages non-blocking subprocesses, continuous log streaming, and process group lifecycle.
 - **Port Detection & Isolation (`environment_detector.py`)**: Dynamically allocates ephemeral ports (9000+), isolating them from control server ports (`8500-8502`).
 - **Preview & Verification Manager (`preview_manager.py`, `project_runner.py`)**: Probes live HTTP endpoints, performs automated repairs for missing entrypoints or Vite configurations, and confirms operational status before reporting success.
+- **Deterministic 6-Gate Validation Matrix**:
+  1. *Specification Alignment*: Validates plan and task graph against requirement before code generation.
+  2. *Structural Completeness*: Verifies all files and directories declared in the architecture contract exist on disk.
+  3. *Syntax & AST Parsing*: Validates Python AST and JS/TS syntax across all synthesized files.
+  4. *Runtime & Socket Health*: Confirms spawned subprocesses bound cleanly to dynamic ports and HTTP endpoints respond.
+  5. *Asset & Content Integrity*: Ensures files, templates, and READMEs are non-empty and uncorrupted.
+  6. *Reviewer Agent Verification*: Automated gatekeeper audit enforcing build invariants.
+
 
 ### 2.4 Persistence Layer (`backend/database/`)
 - **Engine**: SQLite with Write-Ahead Logging (`WAL` mode), foreign keys enabled, and automatic startup recovery reconciliation.

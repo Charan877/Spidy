@@ -74,5 +74,5 @@ Open your browser to: `http://localhost:8501`
      ```bash
      pytest tests
      ```
-   - Ensure all 114+ unit and integration tests pass.
+   - Ensure all 115 unit and integration tests pass.
 
