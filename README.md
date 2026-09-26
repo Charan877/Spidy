@@ -108,38 +108,39 @@ SPIDY replaces ad-hoc LLM generation with a deterministic, role-specialized mult
 
 ```mermaid
 flowchart TD
-    User([User Specification / Follow-Up Prompt]) --> Server[SPIDY Control Server :8501]
+    User["User Specification / Follow-Up Prompt"] --> Server["SPIDY Control Server (localhost:8501)"]
 
-    subgraph BackendCore [Core Orchestration & Persistence]
-        Server --> ActiveCtx[ActiveProjectContext Isolation]
-        Server --> Router[ModelRouter: Resilient Failover]
-        Router --> NIM[Primary: NVIDIA NIM]
-        Router --> OR[Fallback: OpenRouter]
-        Server --> DB[(SQLite Database: data/spidy.db WAL Mode)]
-        ActiveCtx --> Orch[Conversational Orchestrator]
+    subgraph BackendCore ["Core Orchestration & Persistence"]
+        Server --> ActiveCtx["ActiveProjectContext Isolation"]
+        Server --> Router["ModelRouter (Resilient Failover)"]
+        Router --> NIM["Primary: NVIDIA NIM"]
+        Router --> OR["Fallback: OpenRouter"]
+        Server --> DB[("SQLite Database: data/spidy.db (WAL Mode)")]
+        ActiveCtx --> Orch["Conversational Orchestrator"]
     end
 
-    subgraph MultiAgentPipeline [Multi-Agent Pipeline]
-        Orch --> Planner[PlannerAgent: Scoping & DAG]
-        Planner --> Architect[ArchitectAgent: Contracts & Schemas]
-        Architect --> Developer[DeveloperAgent: Multi-File Synthesis]
-        Developer --> Reviewer[ReviewerAgent: 6-Gate Verification]
+    subgraph MultiAgentPipeline ["Multi-Agent Pipeline"]
+        Orch --> Planner["PlannerAgent (Scoping & DAG)"]
+        Planner --> Architect["ArchitectAgent (Contracts & Schemas)"]
+        Architect --> Developer["DeveloperAgent (Multi-File Synthesis)"]
+        Developer --> Reviewer["ReviewerAgent (6-Gate Verification)"]
     end
 
-    subgraph RuntimeSandbox [Runtime & Execution Sandbox]
-        Developer --> WS[workspace/proj_id/]
-        Reviewer --> Runner[ProjectRunner]
-        Runner --> ProcMgr[ProcessManager]
-        ProcMgr --> Ports[Dynamic Ephemeral Ports 9000+]
-        ProcMgr --> Probe[HTTP Prober & Health Checks]
+    subgraph RuntimeSandbox ["Runtime & Execution Sandbox"]
+        Developer --> WS["workspace/project_id/"]
+        Reviewer --> Runner["ProjectRunner"]
+        Runner --> ProcMgr["ProcessManager"]
+        ProcMgr --> Ports["Dynamic Ephemeral Ports (9000+)"]
+        ProcMgr --> Probe["HTTP Prober & Health Checks"]
         Probe --> WS
     end
 
-    Reviewer --> StateMachine[Deterministic State Machine]
+    Reviewer --> StateMachine["Deterministic State Machine"]
     StateMachine --> Server
-    Server --> WSFeed[WebSocket /ws Telemetry Stream]
-    WSFeed --> UI[React 18 + Three.js 3D Visual Interface]
+    Server --> WSFeed["WebSocket Telemetry Stream (/ws)"]
+    WSFeed --> UI["React 18 + Three.js 3D Visual Interface"]
 ```
+
 
 ### Core Architectural Subsystems
 

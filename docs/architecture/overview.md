@@ -10,34 +10,35 @@ SPIDY operates via an asynchronous, event-driven architecture combining a Python
 
 ```mermaid
 flowchart TD
-    User([User Prompt / Conversational Iteration]) --> Server[Starlette / Uvicorn Server (Port 8501)]
-    Server --> ActiveCtx[ActiveProjectContext]
-    Server --> DB[(SQLite Database: data/spidy.db)]
-    Server --> Orch[Conversational Orchestrator]
+    User["User Prompt / Conversational Iteration"] --> Server["Starlette / Uvicorn Server (Port 8501)"]
+    Server --> ActiveCtx["ActiveProjectContext"]
+    Server --> DB[("SQLite Database: data/spidy.db")]
+    Server --> Orch["Conversational Orchestrator"]
 
-    subgraph AgentPipeline [Autonomous Multi-Agent Pipeline]
-        Orch --> Planner[Planner Agent]
-        Planner --> Architect[Architect Agent]
-        Architect --> Developer[Developer Agent]
-        Developer --> Reviewer[Reviewer Agent]
+    subgraph AgentPipeline ["Autonomous Multi-Agent Pipeline"]
+        Orch --> Planner["Planner Agent"]
+        Planner --> Architect["Architect Agent"]
+        Architect --> Developer["Developer Agent"]
+        Developer --> Reviewer["Reviewer Agent"]
     end
 
-    subgraph RuntimeSystem [Runtime & Verification]
-        Reviewer --> Runtime[Project Runner & Process Manager]
-        Runtime --> SocketCheck[Socket Ownership & Port Detection]
-        Runtime --> PreviewMgr[Preview & Verification Manager]
+    subgraph RuntimeSystem ["Runtime & Verification"]
+        Reviewer --> Runtime["Project Runner & Process Manager"]
+        Runtime --> SocketCheck["Socket Ownership & Port Detection"]
+        Runtime --> PreviewMgr["Preview & Verification Manager"]
     end
 
-    subgraph WorkspaceLayer [Isolated Workspaces]
-        Developer --> WS[workspace/proj_<id>/]
+    subgraph WorkspaceLayer ["Isolated Workspaces"]
+        Developer --> WS["workspace/project_id/"]
         Runtime --> WS
     end
 
-    Runtime --> StateMachine[Completion State Machine]
+    Runtime --> StateMachine["Completion State Machine"]
     StateMachine --> Server
-    Server --> WSStream[WebSocket Stream & Event Emitter]
-    WSStream --> UI[Frontend 3D UI & Workspace History]
+    Server --> WSStream["WebSocket Stream & Event Emitter"]
+    WSStream --> UI["Frontend 3D UI & Workspace History"]
 ```
+
 
 ---
 
