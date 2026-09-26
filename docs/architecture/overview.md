@@ -10,9 +10,9 @@ SPIDY operates via an asynchronous, event-driven architecture combining a Python
 
 ```mermaid
 flowchart TD
-    User["User Prompt / Conversational Iteration"] --> Server["Starlette / Uvicorn Server (Port 8501)"]
-    Server --> ActiveCtx["ActiveProjectContext"]
-    Server --> DB[("SQLite Database: data/spidy.db")]
+    User["User Prompt / Specification"] --> Server["Control Server (Starlette / Uvicorn)"]
+    Server --> ActiveCtx["Active Project Context Isolation"]
+    Server --> DB[("State & Audit Persistence (SQLite WAL)")]
     Server --> Orch["Conversational Orchestrator"]
 
     subgraph AgentPipeline ["Autonomous Multi-Agent Pipeline"]
@@ -22,22 +22,23 @@ flowchart TD
         Developer --> Reviewer["Reviewer Agent"]
     end
 
-    subgraph RuntimeSystem ["Runtime & Verification"]
+    subgraph RuntimeSystem ["Runtime Execution & Verification"]
         Reviewer --> Runtime["Project Runner & Process Manager"]
-        Runtime --> SocketCheck["Socket Ownership & Port Detection"]
-        Runtime --> PreviewMgr["Preview & Verification Manager"]
+        Runtime --> SocketCheck["Dynamic Port & Process Tracker"]
+        Runtime --> PreviewMgr["Preview & HTTP Health Manager"]
     end
 
-    subgraph WorkspaceLayer ["Isolated Workspaces"]
-        Developer --> WS["workspace/project_id/"]
+    subgraph WorkspaceLayer ["Sandboxed Workspaces"]
+        Developer --> WS["Isolated Project Directory"]
         Runtime --> WS
     end
 
     Runtime --> StateMachine["Completion State Machine"]
     StateMachine --> Server
     Server --> WSStream["WebSocket Stream & Event Emitter"]
-    WSStream --> UI["Frontend 3D UI & Workspace History"]
+    WSStream --> UI["3D Visual Interface & Live Preview"]
 ```
+
 
 
 ---
