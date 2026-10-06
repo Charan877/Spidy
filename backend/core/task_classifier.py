@@ -35,24 +35,50 @@ class TaskClassifier:
     ) -> str:
         text = (message or "").strip().lower()
 
-        # 1. Explicit or implicit NEW PROJECT patterns
-        # Matches commands creating an app, website, service, tool, or program
+        # 1. Explicit fresh project patterns (e.g. "start from scratch", "brand new project")
         new_project_explicit = (
             r"\b(start from scratch|brand new project|create a new project|fresh project|new project|new app|new application)\b"
         )
         if re.search(new_project_explicit, text):
             return TaskClassification.NEW_PROJECT
 
-        new_project_phrase = (
-            r"\b(build|create|develop|generate|make|write|implement)\s+(a|an|the|me a|me an)?\s*(new\s+)?"
-            r"(full-stack|fullstack|web|rest|fastapi|flask|react|frontend|backend|cli|python|javascript|typescript|"
-            r"portfolio|dashboard|taskflow|task-flow|todo|microservice|app|application|service|tool|game|program|website|system|project)\b"
+        # 0. Affirmative confirmation responses
+        affirmative_patterns = (
+            r"^(yes|yep|yeah|confirm|confirmed|proceed|go ahead|looks good|ok|sure|build it|do it)\b|"
+            r"^(start|start now|start implementation|start building)$|"
+            r"that'?s\s+(what\s+i\s+want|correct|right)|"
+            r"yes,\s*that'?s\s+what\s+i\s+want"
         )
-        if re.search(new_project_phrase, text):
-            # Check if user explicitly specifies modifying current project instead
-            continuation_phrases = r"\b(to the current|to this|in the current|into the current|also add|add to|inside the existing)\b"
-            if not re.search(continuation_phrases, text):
-                return TaskClassification.NEW_PROJECT
+        if re.search(affirmative_patterns, text):
+            return TaskClassification.NEW_PROJECT if (not has_existing_project and existing_files_count == 0) else TaskClassification.MODIFICATION
+
+        # Check for explicit contextual continuation phrases targeting an existing project
+        continuation_phrases = (
+            r"\b(to the current|to this|in the current|into the current|inside the existing|in my existing|to my existing|add to this|add to the current)\b"
+        )
+        has_continuation = bool(re.search(continuation_phrases, text))
+
+        # Check for contextual pronouns referring to existing app ("make it...", "turn it into...", "style it...")
+        is_contextual_pronoun_mod = bool(
+            re.search(r"^(make|turn|change|convert|style|tweak|update|theme)\s+it\b", text)
+            or re.search(r"\b(make it|turn it|convert it|change it|update it|theme it)\b", text)
+            or re.search(r"\b(in this app|to this app|in the current|to the current|my existing)\b", text)
+        )
+
+        # Standalone application creation pattern (e.g. "build an interactive 3D portfolio website", "create a 3D website about Messi", "make an expense tracker")
+        app_noun_pattern = (
+            r"\b(website|web\s*app|webpage|page|portfolio|dashboard|tracker|game|tool|service|api|backend|frontend|"
+            r"full-stack|fullstack|microservice|app|application|system|project|platform|utility|interface|client|bot|store|shop|blog|viewer|explorer)\b"
+        )
+        creation_verb_pattern = r"^(build|create|develop|generate|make|write|implement|launch|deploy|start)\b"
+
+        if (
+            re.search(creation_verb_pattern, text)
+            and re.search(app_noun_pattern, text)
+            and not has_continuation
+            and not is_contextual_pronoun_mod
+        ):
+            return TaskClassification.NEW_PROJECT
 
         # If starts with project building verb and has no existing project
         if not has_existing_project and existing_files_count == 0:
@@ -94,17 +120,31 @@ class TaskClassifier:
         if re.search(r"\b(change|update|modify|replace|alter|edit|rename|style|tweak|make the.*(smaller|larger|darker|lighter|blue|red))\b", text):
             return TaskClassification.MODIFICATION
 
+        # Contextual pronoun modifications (e.g. "make it about Messi", "make it more interactive", "turn it into...")
+        if has_existing_project and re.search(r"\b(make it|turn it|convert it|change it|update it|theme it)\b", text):
+            return TaskClassification.MODIFICATION
+
         # 11. Feature requests (adding new things to existing system)
         if re.search(r"\b(add|include|integrate|support|attach|also add|new feature)\b", text):
             return TaskClassification.FEATURE_REQUEST
 
-        # 12. If starts with build/write/create and describes an independent target
+        # 12. Contextual modifications vs new project verbs
+        if has_existing_project:
+            if re.search(r"^(make|turn|change|convert|style|tweak)\s+it\b", text):
+                return TaskClassification.MODIFICATION
+            if re.search(r"^(add|include|insert|attach|give it)\b", text):
+                return TaskClassification.FEATURE_REQUEST
+
+        # If starts with build/write/create and describes an independent target
         if re.search(r"^(build|create|write|develop|make)\b", text):
+            # If explicit contextual pronoun used with existing project
+            if has_existing_project and re.search(r"\b(it|this|current|existing)\b", text):
+                return TaskClassification.MODIFICATION
             return TaskClassification.NEW_PROJECT
 
         # 13. Default based on context
         if has_existing_project or existing_files_count > 0:
-            if "change" in text or "replace" in text or "tweak" in text:
+            if "change" in text or "replace" in text or "tweak" in text or "make it" in text:
                 return TaskClassification.MODIFICATION
             return TaskClassification.FEATURE_REQUEST
 

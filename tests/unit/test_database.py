@@ -305,6 +305,43 @@ class TestDatabaseLayer(unittest.TestCase):
         self.assertIsNotNone(proj)
         self.assertEqual(proj["name"], "Idempotent Test")
 
+    def test_15_clear_history_safely_resets_data_preserving_schema(self):
+        """15. clear_history() deletes historical records while preserving schema, version, and indexes."""
+        # Seed records across multiple tables
+        self.db_manager.projects.ensure_project(project_id="p_hist", name="Historical App")
+        self.db_manager.builds.create_build(build_id="b_hist", project_id="p_hist", requirement="Historic build")
+        self.db_manager.activity.record_activity(build_id="b_hist", message="History activity")
+        self.db_manager.agents.create_agent_run(build_id="b_hist", agent_name="Developer", status="WORKING")
+        self.db_manager.runtimes.create_session(
+            build_id="b_hist", project_id="p_hist", framework="FastAPI", pid=9999, port=8000, url="http://localhost:8000"
+        )
+        self.db_manager.verification.record_gate_result(build_id="b_hist", gate_name="process", status="PASSED")
+        self.db_manager.messages.save_message(
+            project_id="p_hist", role="user", content="Hi", message_id="m_hist"
+        )
+
+        # Confirm records exist before clear
+        diag_before = self.db_manager.get_diagnostics()
+        self.assertGreater(diag_before["counts"]["projects"], 0)
+        self.assertGreater(diag_before["counts"]["builds"], 0)
+
+        # Execute clear_history
+        deleted = self.db_manager.clear_history()
+        self.assertEqual(deleted["projects"], 1)
+        self.assertEqual(deleted["builds"], 1)
+
+        # Confirm all counts are 0
+        diag_after = self.db_manager.get_diagnostics()
+        self.assertEqual(diag_after["status"], "HEALTHY")
+        self.assertEqual(diag_after["schema_version"], CURRENT_SCHEMA_VERSION)
+        for tbl, cnt in diag_after["counts"].items():
+            self.assertEqual(cnt, 0, f"Table {tbl} should have 0 records after clear_history()")
+
+        # Verify database can still perform fresh insertions after reset
+        fresh_proj = self.db_manager.projects.ensure_project(project_id="p_fresh", name="Fresh Project")
+        self.assertIsNotNone(fresh_proj)
+        self.assertEqual(self.db_manager.projects.get_project("p_fresh")["name"], "Fresh Project")
+
 
 if __name__ == "__main__":
     unittest.main()

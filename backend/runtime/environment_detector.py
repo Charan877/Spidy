@@ -20,11 +20,19 @@ from backend.runtime.runtime_session import NOVA_CONTROL_PORTS
 
 def find_free_port(start_port: int = 9000, max_port: int = 9999) -> int:
     """Find a free TCP port on localhost in the 9000+ range (isolated from NOVA control ports)."""
+    from backend.runtime.process_manager import get_port_owner_pid
+
     for port in range(start_port, max_port):
         if port in NOVA_CONTROL_PORTS:
             continue
+        if get_port_owner_pid(port) is not None:
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                except Exception:
+                    pass
             try:
                 sock.bind(("127.0.0.1", port))
                 return port
@@ -277,19 +285,19 @@ class EnvironmentDetector:
                 install_cmd = [python_exe, "-m", "pip", "install", "-r", str(ws_root / "requirements.txt")] if has_reqs else []
 
                 # Framework-specific startup command selection
+                mod_path = str(Path(fname).with_suffix("")).replace("/", ".").replace("\\", ".")
                 if "FastAPI" in content:
                     framework_type = "FastAPI Web Service"
-                    if "uvicorn.run" in content:
-                        cmd = [python_exe, str(ws_root / fname)]
-                    else:
-                        # Canonical ASGI runner with explicit host & isolated port
-                        cmd = [python_exe, "-m", "uvicorn", f"{stem}:app", "--host", "127.0.0.1", "--port", str(isolated_port)]
+                    app_match = re.search(r"\b(\w+)\s*=\s*FastAPI\s*\(", content)
+                    app_var = app_match.group(1) if app_match else "app"
+                    # Canonical ASGI runner with explicit host & isolated port
+                    cmd = [python_exe, "-m", "uvicorn", f"{mod_path}:{app_var}", "--host", "127.0.0.1", "--port", str(isolated_port)]
                 elif "Flask" in content:
                     framework_type = "Flask Web Service"
                     if "app.run" in content:
                         cmd = [python_exe, str(ws_root / fname)]
                     else:
-                        cmd = [python_exe, "-m", "flask", "--app", stem, "run", "--host", "127.0.0.1", "--port", str(isolated_port)]
+                        cmd = [python_exe, "-m", "flask", "--app", mod_path, "run", "--host", "127.0.0.1", "--port", str(isolated_port)]
                 else:
                     framework_type = "Python Web API"
                     cmd = [python_exe, str(ws_root / fname)]
@@ -377,6 +385,40 @@ class EnvironmentDetector:
                 "main_file": main_py,
                 "requires_install": False,
                 "install_command": [],
+                "has_dev_server": False,
+                "has_docs": False,
+            }
+
+        # 6. Rust project (Cargo.toml)
+        if "Cargo.toml" in files or any(f.endswith("Cargo.toml") for f in files):
+            return {
+                "project_type": "Rust Application",
+                "runtime_type": "cli",
+                "is_web": False,
+                "port": None,
+                "url": None,
+                "command": ["cargo", "run"],
+                "cwd": str(ws_root),
+                "main_file": "src/main.rs" if "src/main.rs" in files else "Cargo.toml",
+                "requires_install": False,
+                "install_command": ["cargo", "build"],
+                "has_dev_server": False,
+                "has_docs": False,
+            }
+
+        # 7. Go project (go.mod)
+        if "go.mod" in files or any(f.endswith("go.mod") for f in files):
+            return {
+                "project_type": "Go Application",
+                "runtime_type": "cli",
+                "is_web": False,
+                "port": None,
+                "url": None,
+                "command": ["go", "run", "."],
+                "cwd": str(ws_root),
+                "main_file": "main.go" if "main.go" in files else "go.mod",
+                "requires_install": False,
+                "install_command": ["go", "build"],
                 "has_dev_server": False,
                 "has_docs": False,
             }

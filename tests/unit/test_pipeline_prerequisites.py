@@ -16,6 +16,13 @@ class TestPipelinePrerequisites(unittest.TestCase):
         self.workspace.list_files.return_value = []
         self.runner = MagicMock(spec=ProjectRunner)
         self.pipeline = MultiAgentPipeline(self.workspace, self.runner)
+        self.orig_understand = self.pipeline.understand_requirement
+
+        def _auto_understand(st):
+            st.auto_confirm = True
+            return self.orig_understand(st)
+
+        self.pipeline.understand_requirement = _auto_understand
 
     # -------------------------------------------------------------------------
     # SCENARIO 1: Valid project generation flow

@@ -7,6 +7,7 @@ Prevents premature execution of downstream agents when workspace preconditions a
 
 import json
 from pathlib import Path
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 import uuid
@@ -19,6 +20,7 @@ from backend.runtime.project_runner import ProjectRunner
 from backend.core.project_state import ProjectState
 from backend.core.task_classifier import TaskClassifier, TaskClassification
 from backend.core.agent_result import AgentResult
+from backend.core.semantic_requirement import SemanticRequirementAnalyzer, EngineeringSpecification
 from backend.core.architecture_contract import (
     ArchitectureContract,
     extract_architecture_contract,
@@ -32,6 +34,7 @@ from backend.core.artifact_validator import is_placeholder_path, validate_artifa
 from backend.core.workspace_manager import WorkspaceManager
 from backend.runtime.environment_detector import EnvironmentDetector
 from backend.runtime.preview_manager import PreviewManager
+from backend.verification.gate_evaluator import GateEvaluator
 
 
 def validate_plan_against_requirement(requirement: str, plan_data: dict) -> Tuple[bool, Optional[str]]:
@@ -91,14 +94,28 @@ class MultiAgentPipeline:
         self.documentation_agent = BaseAgent("Documentation Agent", "Docstrings & Specs")
         self.reviewer_agent = ReviewerAgent()
 
+    def can_execute_plan(self, state: ProjectState) -> bool:
+        """Verify that requirements exist and confirmation has been granted before planning."""
+        if not (state.goal or state.requirements):
+            return False
+        if state.is_awaiting_confirmation() or not state.can_execute_engineering():
+            return False
+        return True
+
     def can_execute_build(self, state: ProjectState) -> bool:
-        """Verify that architecture and requirements are prepared before building."""
+        """Verify that architecture and requirements are prepared and confirmed before building."""
+        if state.is_awaiting_confirmation():
+            return False
         return bool(state.goal or state.requirements)
 
     def can_execute_run(self, state: ProjectState) -> bool:
         """Verify that project has been generated and workspace contains files before running."""
+        if state.is_awaiting_confirmation():
+            return False
         workspace_files = self.workspace.list_files()
         if not workspace_files or len(workspace_files) == 0:
+            return False
+        if state.has_failed_required_tasks(phase="BUILD"):
             return False
         if not state.is_project_generated:
             state.is_project_generated = True
@@ -107,6 +124,8 @@ class MultiAgentPipeline:
 
     def can_execute_test(self, state: ProjectState) -> bool:
         """Verify that project is generated and runnable before testing."""
+        if state.is_awaiting_confirmation():
+            return False
         if not state.is_project_generated:
             return False
         workspace_files = self.workspace.list_files()
@@ -116,6 +135,8 @@ class MultiAgentPipeline:
 
     def can_execute_debug(self, state: ProjectState) -> bool:
         """Verify that debugging is warranted: workspace exists, project generated, and not precondition failure."""
+        if state.is_awaiting_confirmation():
+            return False
         if not state.is_project_generated:
             return False
         workspace_files = self.workspace.list_files()
@@ -143,28 +164,84 @@ class MultiAgentPipeline:
             return "TEST"
         return "COMPLETE"
 
-    def analyze_and_plan(self, state: ProjectState) -> None:
-        """Phase 1: Discover, Plan & Architect requirements."""
+    def understand_requirement(self, state: ProjectState) -> bool:
+        """Phase 1A: Non-executing semantic requirement understanding layer.
+        
+        Builds EngineeringSpecification, determines domain, core capabilities, and concise
+        interpretation. Halts execution if user confirmation is required.
+        """
+        state.transition_to("UNDERSTANDING", "Requirement received: analyzing intent and engineering scope...")
+        state.original_goal = state.goal
+        state.requirements = state.goal
+        state.current_phase = "UNDERSTAND"
+        state.add_activity("Requirement received: analyzing scope and technology stack...", level="run")
+
+        contract = extract_architecture_contract(state.goal, selected_language=state.selected_language)
+        state.architecture_contract = contract.to_dict()
+        state.fullstack_contract = contract.to_dict()
+        state.test_crud_endpoint = contract.test_crud_endpoint
+        state.test_crud_payload = contract.test_crud_payload
+
+        # Semantic Requirement Understanding Layer (non-executing)
+        eng_spec = SemanticRequirementAnalyzer.analyze(
+            requirement=state.goal,
+            active_context=state.active_context,
+            existing_project_spec=state.project_spec,
+            selected_language=state.selected_language,
+        )
+        state.engineering_spec = eng_spec.to_dict()
+        state.requirement_interpretation = eng_spec.concise_interpretation
+        state.pending_intent = eng_spec.intent_classification
+        state.pending_target_project_id = eng_spec.target_project_id
+        state.pending_requirement = state.goal
+        state.pending_confirmation_id = f"conf_{state.build_id}"
+
+        # Determine whether auto-confirmation has been explicitly requested
+        if not getattr(state, "auto_confirm", False):
+            state.interpretation_status = "PENDING"
+            state.user_approved = False
+            state.transition_to("AWAITING_CONFIRMATION", f"Interpretation pending user confirmation: {eng_spec.concise_interpretation}")
+            state.add_activity(f"Interpreted Intent: {eng_spec.concise_interpretation}", level="ok")
+            state.add_activity("Please confirm this interpretation to begin implementation.", level="dim")
+            return False
+
+        self.confirm_interpretation(state)
+        return True
+
+    def confirm_interpretation(self, state: ProjectState) -> bool:
+        """Atomically transition state through confirmation barrier:
+        AWAITING_CONFIRMATION -> CONFIRMED -> ENGINEERING_READY
+        """
+        state.interpretation_status = "CONFIRMED"
+        state.user_approved = True
+        state.transition_to("CONFIRMED", "Requirement interpretation confirmed by user.")
+        state.transition_to("ENGINEERING_READY", "Execution barrier released. System ready for planning and engineering.")
+        state.release_task_graph()
+        state.add_activity("Requirement interpretation confirmed. Proceeding to planning & architecture.", level="ok")
+        return True
+
+    def plan_and_architect(self, state: ProjectState) -> None:
+        """Phase 1B: Plan & Architect project (executes ONLY after requirement is confirmed)."""
+        if not self.can_execute_plan(state) or not state.can_execute_engineering():
+            state.add_activity("Planning blocked: requirement interpretation has not been confirmed.", level="bad")
+            return
 
         def _plan_action(st: ProjectState):
-            st.transition_to("PLANNING", "Requirement received: analyzing scope and technology stack...")
-            st.original_goal = st.goal
-            st.requirements = st.goal
-            st.current_phase = "DISCOVER"
-            st.add_activity("Requirement received: analyzing scope and technology stack...", level="run")
+            st.transition_to("PLANNING", "Requirement confirmed: designing architecture and task dependency graph...")
+            st.current_phase = "PLAN"
+            st.add_activity("Planner & Architect activated: generating project architecture...", level="run")
 
             goal_lower = st.goal.lower()
+            contract = extract_architecture_contract(st.goal, selected_language=st.selected_language)
             is_fullstack_req = (
-                any(be in goal_lower for be in ["fastapi", "flask", "backend", "api", "rest api", "endpoint"])
-                and any(fe in goal_lower for fe in ["frontend", "dashboard", "html", "web", "ui", "interface", "app"])
+                contract.is_strict_fullstack
+                or (
+                    bool(re.search(r"\b(fastapi|flask|backend|api|rest\s*api|endpoint)\b", goal_lower))
+                    and bool(re.search(r"\b(frontend|dashboard|html|web|interface)\b", goal_lower))
+                )
             )
 
-            contract = extract_architecture_contract(st.goal, selected_language=st.selected_language)
-            st.architecture_contract = contract.to_dict()
-            st.fullstack_contract = contract.to_dict()
-            st.test_crud_endpoint = contract.test_crud_endpoint
-            st.test_crud_payload = contract.test_crud_payload
-
+            raw_eng_spec = st.engineering_spec or {}
             system_prompt = (
                 "You are an expert AI Software Architect and Tech Lead for SPIDY.\n"
                 "Analyze the user requirement and generate a complete project architecture plan in valid JSON format.\n"
@@ -182,6 +259,7 @@ class MultiAgentPipeline:
 
             user_msg = (
                 f"User Requirement: {st.goal}\n"
+                f"Inferred Engineering Specification: {json.dumps(raw_eng_spec, indent=2)}\n"
                 f"User Selected Language Preference: {st.selected_language}\n\n"
                 f"{contract.to_prompt_instructions()}\n"
             )
@@ -190,18 +268,25 @@ class MultiAgentPipeline:
             elif st.selected_language != "Auto Detect":
                 user_msg += f"Note: User explicitly requested {st.selected_language}. Respect this choice."
 
-            response_raw = call_openrouter(
-                messages=[{"role": "user", "content": user_msg}],
-                system_prompt=system_prompt,
-                temperature=0.2,
-                role="planner",
-            )
-
-            plan_data = parse_json_response(response_raw)
+            try:
+                response_raw = call_openrouter(
+                    messages=[{"role": "user", "content": user_msg}],
+                    system_prompt=system_prompt,
+                    temperature=0.2,
+                    role="planner",
+                )
+                plan_data = parse_json_response(response_raw)
+            except Exception as exc:
+                st.add_activity(f"Planner LLM call failed or provider unavailable ({exc}). Synthesizing deterministic architecture from contract...", level="run")
+                plan_data = {}
 
             # Architecture Context Mismatch & Compliance Validation Gate (Bug 1, Bug 2)
-            is_valid_arch, mismatch_reason = validate_plan_against_requirement(st.goal, plan_data)
-            is_compliant, compliance_reason = validate_plan_compliance(contract, plan_data)
+            if not plan_data:
+                is_valid_arch, mismatch_reason = False, "No plan data received from LLM provider"
+                is_compliant, compliance_reason = False, "Provider unavailable or returned invalid JSON"
+            else:
+                is_valid_arch, mismatch_reason = validate_plan_against_requirement(st.goal, plan_data)
+                is_compliant, compliance_reason = validate_plan_compliance(contract, plan_data)
 
             if not is_valid_arch or not is_compliant:
                 reason = mismatch_reason or compliance_reason
@@ -236,10 +321,16 @@ class MultiAgentPipeline:
             if is_fullstack_req or contract.is_strict_fullstack or plan_data.get("is_fullstack"):
                 st.effective_language = "Fullstack"
                 st.runtime_type = "fullstack"
+            elif raw_eng_spec.get("application_type") == "web_3d":
+                st.effective_language = "HTML/CSS/JS"
+                st.runtime_type = "web_3d"
+                st.project_type = "3D Web Application"
             elif st.selected_language and st.selected_language != "Auto Detect":
                 st.effective_language = st.selected_language
+                st.runtime_type = contract.project_type
             else:
                 st.effective_language = st.detected_language
+                st.runtime_type = contract.project_type
 
             st.architecture_summary = plan_data.get("architecture_summary", f"{contract.project_name} application architecture.")
             st.tech_stack = plan_data.get("tech_stack", [st.effective_language])
@@ -265,6 +356,27 @@ class MultiAgentPipeline:
                 tid = f"t-{idx+1}"
                 is_fe = fname.endswith((".html", ".css", ".js", ".ts", ".jsx", ".tsx"))
                 deps = list(backend_task_ids) if (is_fe and backend_task_ids) else []
+                
+                # Derive semantic task description and expected output
+                if "database" in fname.lower() or "models" in fname.lower():
+                    task_desc = f"Implement database schemas, connection management, and persistence layer in {fname}"
+                    exp_out = f"Valid database initialization code and data models in {fname}"
+                elif "router" in fname.lower() or "api" in fname.lower() or "main.py" in fname.lower():
+                    task_desc = f"Implement REST API endpoints, routing, request validation, and business logic in {fname}"
+                    exp_out = f"FastAPI/Flask API routes with CORS, root, and health endpoints in {fname}"
+                elif "app.tsx" in fname.lower() or "main.tsx" in fname.lower() or "index.html" in fname.lower():
+                    task_desc = f"Construct frontend entry point and UI layout with backend integration in {fname}"
+                    exp_out = f"Functional, responsive web interface interacting with backend in {fname}"
+                elif "component" in fname.lower():
+                    task_desc = f"Create reusable interactive UI component in {fname}"
+                    exp_out = f"Clean TypeScript/JavaScript UI component in {fname}"
+                elif "requirements" in fname.lower() or "package.json" in fname.lower():
+                    task_desc = f"Define third-party dependencies and build scripts in {fname}"
+                    exp_out = f"Complete dependencies configuration without version conflicts in {fname}"
+                else:
+                    task_desc = f"Implement application module {fname} according to architecture contract"
+                    exp_out = f"Production-ready source code in {fname}"
+
                 st.add_task(
                     task_id=tid,
                     title=f"Generate {fname}",
@@ -275,6 +387,9 @@ class MultiAgentPipeline:
                     is_required=True,
                     build_id=st.build_id,
                     project_id=st.project_id,
+                    description=task_desc,
+                    expected_output=exp_out,
+                    evidence_required="code_artifact_syntax_valid",
                 )
                 build_task_ids.append(tid)
                 if is_fe:
@@ -293,6 +408,9 @@ class MultiAgentPipeline:
                 is_required=True,
                 build_id=st.build_id,
                 project_id=st.project_id,
+                description="Start isolated application process, detect dynamic port, and verify TCP socket.",
+                expected_output="Active runtime process with bound listening TCP port outside control range.",
+                evidence_required="process_alive_and_port_listening",
             )
 
             # 3. TEST task depends on RUN task
@@ -306,6 +424,9 @@ class MultiAgentPipeline:
                 is_required=True,
                 build_id=st.build_id,
                 project_id=st.project_id,
+                description="Poll HTTP health endpoints, inspect runtime logs, and verify application responsiveness.",
+                expected_output="HTTP 200 health response and valid application/API content.",
+                evidence_required="http_health_check_passed",
             )
 
             # 4. DOCUMENT task depends on TEST task (optional, not strictly failing runtime)
@@ -319,6 +440,9 @@ class MultiAgentPipeline:
                 is_required=False,
                 build_id=st.build_id,
                 project_id=st.project_id,
+                description="Generate project-specific README.md with overview, architecture, endpoints, and setup instructions.",
+                expected_output="Comprehensive project-specific README.md without placeholder boilerplate.",
+                evidence_required="documentation_valid",
             )
 
             # Calculate dynamic pre-build estimate
@@ -336,17 +460,25 @@ class MultiAgentPipeline:
             st.current_phase = "PLAN"
             st.add_activity(f"Architecture defined for {st.project_name} ({st.effective_language}) | Est: {est.range_str}", level="ok")
 
+            if st.project_state == "WAITING_FOR_USER":
+                st.current_phase = "PLAN"
+                return
+
             if plan_data.get("is_complex") and st.clarifying_questions:
-                st.user_approved = False
-                st.transition_to("CLARIFYING", "Complex project detected. Awaiting user clarification.")
-                st.add_activity("Complex project detected. Awaiting user approval/clarification.", level="dim")
-            else:
-                st.user_approved = True
-                st.transition_to("ARCHITECTING", "Scope validated. Architecture established.")
-                st.current_phase = "ARCHITECT"
-                st.add_activity("Scope validated. Proceeding to build phase.", level="ok")
+                st.add_activity("Autonomous Tech Lead resolved architectural scope with best-practice defaults.", level="dim")
+            st.user_approved = True
+            st.transition_to("ARCHITECTING", "Scope validated. Architecture established.")
+            st.current_phase = "ARCHITECT"
+            st.add_activity("Scope validated. Proceeding to build phase.", level="ok")
 
         self.planner_agent.execute(state, _plan_action)
+
+    def analyze_and_plan(self, state: ProjectState) -> None:
+        """Phase 1: Discover, Plan & Architect requirements with hard confirmation gate."""
+        confirmed = self.understand_requirement(state)
+        if not confirmed or state.is_awaiting_confirmation():
+            return
+        self.plan_and_architect(state)
 
     def _get_workspace_dir(self) -> Optional[Path]:
         ws_root = getattr(self.workspace, "root", None)
@@ -356,6 +488,10 @@ class MultiAgentPipeline:
 
     def execute_build(self, state: ProjectState) -> None:
         """Phase 2: Build, Run, Test, Auto-Debug, Document project with strict prerequisite enforcement."""
+        if state.is_awaiting_confirmation():
+            state.add_activity("execute_build blocked: requirement interpretation is awaiting user confirmation.", level="bad")
+            return
+
         if not state.build_start_time:
             state.build_start_time = time.time()
 
@@ -608,13 +744,16 @@ class MultiAgentPipeline:
 
                 for attempt in range(1, 4):
                     state.retry_task(task.id, attempt)
+                    last_err = task.error or "Artifact validation failed or file was not generated."
                     recovery_prompt = (
                         f"RECOVERY ATTEMPT {attempt}/3 for {target_file}:\n"
                         f"Project: {state.project_name}\n"
                         f"Goal: {state.goal}\n"
                         f"Architecture: {state.architecture_summary}\n"
                         f"Language / Stack: {state.effective_language}\n"
+                        f"PREVIOUS FAILURE EVIDENCE: {last_err}\n"
                         f"Generate complete, fully functional, production-ready code for ONLY this file: {target_file}\n"
+                        f"Ensure the issue described in the failure evidence above is resolved.\n"
                         f"Do NOT omit any code. Output using:\n"
                         f"### FILE: {target_file}\n```\ncode\n```"
                     )
@@ -645,6 +784,7 @@ class MultiAgentPipeline:
                             if is_valid:
                                 self.workspace.write_file(target_file, rec_content)
                                 state.files[target_file] = rec_content
+                                state.record_success("artifact_generation", target_file)
                                 agent_res = AgentResult(
                                     status="RECOVERED",
                                     task_id=task.id,
@@ -662,13 +802,26 @@ class MultiAgentPipeline:
                                 break
                             else:
                                 state.add_activity(f"Recovery attempt {attempt}/3 for {target_file} validation failed: {val_reason}", level="bad")
+                                task.error = f"Validation failed: {val_reason}"
+                                is_loop = state.record_failure("artifact_generation", "VALIDATION_FAILURE", target_file, val_reason, phase="BUILD")
+                                if is_loop:
+                                    state.add_activity(f"Halting recovery retries for {target_file}: repeated identical validation failure.", level="bad")
+                                    break
                         else:
                             state.add_activity(f"Recovery attempt {attempt}/3 for {target_file} produced empty response", level="bad")
+                            is_loop = state.record_failure("artifact_generation", "EMPTY_RESPONSE", target_file, "empty response", phase="BUILD")
+                            if is_loop:
+                                state.add_activity(f"Halting recovery retries for {target_file}: repeated empty response.", level="bad")
+                                break
 
                     except Exception as rec_exc:
                         state.add_activity(f"Recovery attempt {attempt}/3 failed for {target_file}: {rec_exc}", level="bad")
+                        is_loop = state.record_failure("artifact_generation", "EXCEPTION", target_file, str(rec_exc), phase="BUILD")
+                        if is_loop:
+                            state.add_activity(f"Halting recovery retries for {target_file}: repeated exception.", level="bad")
+                            break
 
-                else:
+                if task.status != "SUCCESS":
                     agent_res = AgentResult(
                         status="FAILED",
                         task_id=task.id,
@@ -676,22 +829,22 @@ class MultiAgentPipeline:
                         build_id=state.build_id,
                         success=False,
                         artifact_path=target_file,
-                        error=f"Exhausted 3 recovery attempts for {target_file}",
-                        recovery_attempt=3,
+                        error=f"Exhausted recovery attempts or loop detected for {target_file}",
+                        recovery_attempt=attempt,
                     )
-                    state.fail_task(task.id, f"Exhausted 3 recovery attempts for {target_file}", agent_result=agent_res)
+                    state.fail_task(task.id, f"Exhausted recovery attempts for {target_file}", agent_result=agent_res)
 
             # Re-evaluate task dependency graph now that recovery completed
             state.recalculate_task_graph()
 
         # GENERATION GATE: Verify workspace contains files and no required build tasks failed
         workspace_files = self.workspace.list_files()
-        has_failed_required = state.has_failed_required_tasks()
+        has_failed_required = state.has_failed_required_tasks(phase="BUILD")
         if not workspace_files or len(workspace_files) == 0 or has_failed_required:
             state.is_project_generated = False
             state.project_generation_status = "GENERATION_FAILED"
             state.failure_type = "PROJECT_GENERATION_FAILURE"
-            failed_tasks = [t.title for t in state.tasks if t.status == "FAILED" and getattr(t, "is_required", True)]
+            failed_tasks = [t.title for t in state.tasks if t.phase == "BUILD" and t.status == "FAILED" and getattr(t, "is_required", True)]
             if not workspace_files or len(workspace_files) == 0:
                 state.failure_classification = "PRECONDITION_FAILURE"
                 state.failure_reason = "No files were generated in workspace."
@@ -796,13 +949,23 @@ class MultiAgentPipeline:
 
         def _run_action(st: ProjectState):
             for task in run_tasks:
+                if not st.is_task_ready(task):
+                    st.block_task(task.id, "Prerequisite BUILD tasks not completed successfully.")
+                    continue
                 st.set_active_task(task.id)
                 success = self.runner.run(st)
                 if success:
+                    task.evidence_collected = {
+                        "pid": st.runtime_pid,
+                        "port": st.runtime_port,
+                        "url": st.runtime_url,
+                        "status": st.runtime_status,
+                    }
                     st.complete_task(task.id)
                 elif st.failure_classification == "PRECONDITION_FAILURE":
                     st.block_task(task.id, f"Precondition failed: {st.failure_reason}")
                 else:
+                    st.failure_classification = st.failure_classification or "RUNTIME_STARTUP_FAILURE"
                     st.fail_task(task.id, f"Process startup or runtime verification failed: {st.failure_reason or st.failure_classification}")
 
         self.tester_agent.execute(state, _run_action)
@@ -868,31 +1031,81 @@ class MultiAgentPipeline:
                                 st.files[fname] = cleaned_fixed
                                 st.add_activity(f"Debugger Agent fixed syntax in {fname}", level="ok")
 
-                # Auto-recovery if process failed (and preconditions were satisfied)
-                if (st.runtime_status == "FAILED" or has_syntax_err) and self.can_execute_debug(st):
+                # Auto-recovery if process failed or application verification failed (and preconditions were satisfied)
+                is_failed = (st.runtime_status == "FAILED" or has_syntax_err or not st.is_app_verified or not st.project_success)
+                if is_failed and self.can_execute_debug(st):
                     st.current_phase = "DEBUG"
-                    st.transition_to("DEBUGGING", "Runtime failure detected; attempting repair")
-                    st.add_activity("Runtime failure detected. Debugger Agent repairing workspace...", level="bad")
+                    st.transition_to("DEBUGGING", "Runtime or application verification failure detected; attempting repair")
+                    st.add_activity("Runtime/verification failure detected. Debugger Agent repairing workspace...", level="bad")
 
-                    logs = self.runner.process_manager.get_logs_text()
+                    logs = ""
+                    pm = getattr(self.runner, "process_manager", None)
+                    if pm and hasattr(pm, "get_logs_text"):
+                        try:
+                            logs = pm.get_logs_text() or ""
+                        except Exception:
+                            logs = getattr(st, "runtime_logs", "") or ""
+                    else:
+                        logs = getattr(st, "runtime_logs", "") or ""
+
+                    browser_errs = [err for err in st.errors if "Browser" in err or "Console" in err or "Exception" in err or "Canvas" in err]
+                    browser_err_text = "\n".join(browser_errs)
+                    
+                    # Target specific file mentioned in traceback, browser errors, or failure reason
+                    targeted_file = None
+                    all_err_text = f"{st.failure_reason or ''}\n{browser_err_text}\n{logs}"
+                    for fname in st.files.keys():
+                        base = fname.split("/")[-1]
+                        if fname in all_err_text or (len(base) > 3 and base in all_err_text):
+                            targeted_file = fname
+                            break
+
+                    if not targeted_file:
+                        file_match = re.search(r'File "([^"]+\.[a-zA-Z0-9]+)"', logs) or re.search(r"File '([^']+\.[a-zA-Z0-9]+)'", logs)
+                        if file_match:
+                            cand = file_match.group(1).replace("\\", "/")
+                            for f in st.files.keys():
+                                if f in cand or cand.endswith(f):
+                                    targeted_file = f
+                                    break
+
+                    if not targeted_file:
+                        if st.is_web_project or getattr(st, "runtime_type", "") in ("web", "web_3d", "fullstack"):
+                            targeted_file = next(
+                                (f for f in st.files.keys() if f in ("index.html", "src/App.tsx", "src/App.jsx", "main.js", "script.js", "app.js")),
+                                list(st.files.keys())[0] if st.files else "index.html"
+                            )
+                        else:
+                            targeted_file = next((f for f in st.files.keys() if "main" in f or "app" in f), list(st.files.keys())[0] if st.files else "main.py")
+
+                    relevant_files_text = ""
+                    code_exts = (".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".htm", ".css", ".json", "requirements.txt", "package.json")
+                    for f_name, f_content in st.files.items():
+                        if f_name == targeted_file or any(f_name.endswith(ext) for ext in code_exts):
+                            relevant_files_text += f"\n### FILE: {f_name}\n```\n{f_content[:2500]}\n```\n"
+
                     debug_prompt = (
-                        f"The project failed to run.\n"
-                        f"Runtime Logs:\n{logs[-1000:]}\n\n"
-                        f"Workspace files: {list(st.files.keys())}\n"
-                        f"Main file content:\n{list(st.files.values())[0] if st.files else ''}\n\n"
-                        "Fix the errors and output corrected files in ### FILE: path/to/file format."
+                        f"The project encountered a runtime or application verification failure.\n"
+                        f"Failure Classification: {st.failure_classification}\n"
+                        f"Failure Reason: {st.failure_reason}\n"
+                        + (f"Browser Verification Errors:\n{browser_err_text}\n\n" if browser_err_text else "")
+                        + f"Targeted File with error: {targeted_file}\n\n"
+                        f"Runtime Logs:\n{logs[-2500:]}\n\n"
+                        f"Relevant Workspace Files:\n{relevant_files_text}\n\n"
+                        f"Project Architecture: {st.architecture_summary}\n"
+                        "Fix the root cause and output the corrected file(s) in ### FILE: path/to/file format."
                     )
 
                     fixed_raw = call_openrouter(
                         messages=[{"role": "user", "content": debug_prompt}],
-                        system_prompt="You are a senior debugger. Output corrected files.",
+                        system_prompt="You are a senior debugger. Output corrected files with full working code.",
                         temperature=0.1,
                         role="debugger",
                     )
-                    fixed_files = parse_multi_file_response(fixed_raw)
+                    fixed_files = parse_multi_file_response(fixed_raw, default_filename=targeted_file)
                     for path, text in fixed_files.items():
                         if path in st.files or len(fixed_files) == 1:
-                            target = path if path in st.files else list(st.files.keys())[0]
+                            target = path if path in st.files else targeted_file
                             self.workspace.write_file(target, text)
                             st.files[target] = text
                             st.add_activity(f"Applied debug fix to {target}", level="ok")
@@ -900,16 +1113,28 @@ class MultiAgentPipeline:
                     # Re-run after debug
                     st.add_activity("Re-starting process after applying debug fix...", level="run")
                     re_success = self.runner.restart(st)
-                    if re_success:
+                    if re_success and st.project_success and (not st.is_web_project or st.is_app_verified):
+                        task.evidence_collected = {
+                            "recovered": True,
+                            "runtime_status": st.runtime_status,
+                            "gates": dict(st.verification_gates),
+                        }
                         st.complete_task(task.id)
                     else:
+                        st.failure_classification = st.failure_classification or "DEBUG_REPAIR_FAILURE"
                         st.fail_task(task.id, f"Verification failed after debug: {st.failure_reason or st.failure_classification}")
-                elif st.runtime_status == "FAILED":
+                elif st.runtime_status == "FAILED" or not st.is_app_verified or not st.project_success:
                     st.block_task(task.id, f"Debugging blocked: {st.failure_reason or 'precondition failure'}")
                 else:
-                    if st.project_success:
+                    if st.project_success and (not st.is_web_project or st.is_app_verified):
+                        task.evidence_collected = {
+                            "runtime_status": st.runtime_status,
+                            "gates": dict(st.verification_gates),
+                            "targets": list(st.runtime_targets),
+                        }
                         st.complete_task(task.id)
                     else:
+                        st.failure_classification = st.failure_classification or "RUNTIME_VERIFICATION_FAILURE"
                         st.fail_task(task.id, f"Runtime verification failed: {st.failure_reason or st.failure_classification}")
 
         self.debugger_agent.execute(state, _test_debug_action)
@@ -991,13 +1216,21 @@ class MultiAgentPipeline:
 
         # Bounded recovery loop if Reviewer detected issues (max 3 retries)
         while review_verdict.verdict == "NEEDS_RECOVERY" and state.recovery_attempts < 3:
+            issues_str = "; ".join(review_verdict.issues) if review_verdict.issues else "Unknown issue"
+            is_loop = state.record_failure("reviewer_audit", "NEEDS_RECOVERY", "workspace", issues_str, phase="REVIEW")
+            if is_loop:
+                state.add_activity("Halting reviewer recovery: identical reviewer issues repeated without progress.", level="bad")
+                break
+
             state.recovery_attempts += 1
             state.add_activity(
-                f"Reviewer identified issues. Commencing bounded recovery (Attempt {state.recovery_attempts}/3)...",
+                f"Reviewer identified issues: {issues_str}. Commencing bounded recovery (Attempt {state.recovery_attempts}/3)...",
                 level="run",
             )
             self._attempt_recovery(state, review_verdict)
             review_verdict = self.reviewer_agent.review(state, ws_dir)
+            if review_verdict.verdict == "PASS":
+                state.record_success("reviewer_audit", "workspace")
 
         # Finalize: NEVER FAKE SUCCESS! Check all verification gates
         has_failed_required = state.has_failed_required_tasks()
@@ -1007,14 +1240,19 @@ class MultiAgentPipeline:
         else:
             asset_ok, missing_assets = True, []
 
+        # Authoritative multi-gate evaluation
+        build_gate = GateEvaluator.evaluate_build(ws_dir, state.files, getattr(state, "architecture_contract", None))
+        state.verification_gates["build"] = build_gate.passed
+
         is_verified = (
             state.is_project_generated
             and state.project_success
-            and state.runtime_status == "RUNNING"
+            and (state.runtime_status in ("RUNNING", "STOPPED") if not state.is_web_project else state.runtime_status == "RUNNING")
             and (not state.is_web_project or state.is_app_verified)
             and not has_failed_required
             and reviewer_passed
             and asset_ok
+            and build_gate.passed
         )
 
         if is_verified:
@@ -1047,6 +1285,7 @@ class MultiAgentPipeline:
                 failure_reasons.append(state.failure_reason or f"runtime status is {state.runtime_status}")
             failure_msg = "; ".join(failure_reasons) if failure_reasons else (state.failure_reason or f"Runtime status is {state.runtime_status}")
             state.failure_reason = failure_msg
+            state.failure_classification = state.failure_classification or "VERIFICATION_FAILURE"
             state.current_task_description = f"Project verification FAILED: {failure_msg}"
             state.add_activity(f"Pipeline execution halted with verification FAILURE: {failure_msg}", level="bad")
 
@@ -1184,6 +1423,10 @@ class MultiAgentPipeline:
         selected_language: str = "Auto Detect",
     ) -> None:
         """Execute a conversational interaction turn with continuity and state persistence."""
+        if state.is_awaiting_confirmation() or not state.can_execute_engineering():
+            state.add_activity("Conversational execution blocked: confirmation barrier is active.", level="bad")
+            return
+
         existing_files = self.workspace.list_files() if hasattr(self.workspace, "list_files") else []
         has_existing = bool(state.is_project_generated or state.files or existing_files)
 

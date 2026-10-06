@@ -10,6 +10,7 @@ interface ScrollStoryOverlayProps {
   isLoading: boolean;
   onScrollToSection: (sectionIndex: number) => void;
   onOpenWorkspace: () => void;
+  isLegitimateSuccess?: boolean;
 }
 
 const STAGES = [
@@ -30,9 +31,10 @@ export const ScrollStoryOverlay: React.FC<ScrollStoryOverlayProps> = ({
   isLoading,
   onScrollToSection,
   onOpenWorkspace,
+  isLegitimateSuccess = false,
 }) => {
   const p = Math.max(0, Math.min(1, scrollProgress));
-  const activeIndex = Math.min(7, Math.floor(p * 8));
+  const activeIndex = Math.min(7, Math.max(0, Math.round(p * 7)));
 
   // Opacity bell curve strictly preventing text collision between stages
   const getStageOpacity = (stageIndex: number) => {
@@ -214,6 +216,7 @@ export const ScrollStoryOverlay: React.FC<ScrollStoryOverlayProps> = ({
             Boolean(state.has_failed_required_tasks && state.current_phase !== 'BUILD' && state.current_phase !== 'DISCOVER');
 
           const isVerifiedSuccess =
+            isLegitimateSuccess &&
             !isFailed &&
             state.current_phase === 'COMPLETE' &&
             state.project_state === 'SUCCESS' &&
@@ -257,51 +260,8 @@ export const ScrollStoryOverlay: React.FC<ScrollStoryOverlayProps> = ({
                   </div>
                 </>
               ) : isVerifiedSuccess ? (
-                <>
-                  <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.25em] text-emerald-400 font-medium mb-2">
-                    <CheckCircle className="w-3 h-3 text-emerald-400" />
-                    <span>SIX-GATE CONVERGENCE VERIFIED</span>
-                  </div>
-
-                  <div className="flex items-center gap-3">
-                    <h2 className="font-display text-[clamp(2.2rem,4.5vw,3.6rem)] font-bold tracking-tight text-white leading-none">
-                      BUILT.
-                    </h2>
-                    <h2
-                      className={`font-display text-[clamp(2.2rem,4.5vw,3.6rem)] font-bold tracking-tight text-gradient-emerald leading-none transition-all duration-500 ${
-                        showVerified ? 'opacity-100 scale-100' : 'opacity-0 scale-95'
-                      }`}
-                    >
-                      VERIFIED.
-                    </h2>
-                  </div>
-
-                  <p className="font-body text-xs text-slate-400 font-normal mt-2 max-w-md">
-                    The software pipeline has synthesized and validated. Ready for deployment.
-                  </p>
-
-                  <div className="mt-4 flex items-center justify-center gap-3 pointer-events-auto">
-                    {state.runtime_url ? (
-                      <a
-                        href={state.runtime_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="flex items-center gap-1.5 px-5 py-2 rounded-full font-mono text-[11px] uppercase tracking-wider font-semibold bg-white text-black hover:bg-sky-200 transition-all cursor-pointer shadow-[0_0_20px_rgba(255,255,255,0.3)]"
-                      >
-                        <span>OPEN APPLICATION</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
-                    ) : (
-                      <button
-                        onClick={onOpenWorkspace}
-                        className="flex items-center gap-1.5 px-5 py-2 rounded-full font-mono text-[11px] uppercase tracking-wider font-medium bg-white/[0.08] hover:bg-white/[0.14] text-white border border-white/[0.12] transition-all cursor-pointer"
-                      >
-                        <span>INSPECT WORKSPACE</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </button>
-                    )}
-                  </div>
-                </>
+                /* SuccessView in App.tsx renders the authoritative interactive glass result console */
+                null
               ) : (
                 <>
                   <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.25em] text-sky-400 font-medium mb-2">

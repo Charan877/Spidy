@@ -97,6 +97,52 @@ class DatabaseManager:
                 "error": str(exc),
             }
 
+    def clear_history(self) -> Dict[str, int]:
+        """Safely clear historical projects, builds, agent runs, activity, runtimes, verification, and messages.
+
+        Preserves database schema, schema_version table, and performance indexes.
+        Executes a WAL checkpoint and vacuum to ensure no stale data remains in WAL/SHM.
+        Returns a dict of deleted row counts per table.
+        """
+        deleted_counts = {}
+        tables_in_order = [
+            "messages",
+            "verification",
+            "activity",
+            "agent_runs",
+            "runtime_sessions",
+            "builds",
+            "projects",
+        ]
+        with self.factory.connect() as conn:
+            cursor = conn.cursor()
+            for table in tables_in_order:
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table};")
+                    count_before = cursor.fetchone()[0]
+                    cursor.execute(f"DELETE FROM {table};")
+                    deleted_counts[table] = count_before
+                except Exception:
+                    deleted_counts[table] = 0
+            conn.commit()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.execute("VACUUM;")
+            except Exception as opt_exc:
+                logger.warning(f"WAL checkpoint/vacuum warning during history reset: {opt_exc}")
+
+        # Clean up any lingering 0-byte WAL/SHM files
+        for ext in ("-wal", "-shm"):
+            aux_file = Path(f"{self.db_path}{ext}")
+            if aux_file.exists() and aux_file.stat().st_size == 0:
+                try:
+                    aux_file.unlink()
+                except Exception:
+                    pass
+
+        logger.info(f"Database history cleared cleanly: {deleted_counts}")
+        return deleted_counts
+
     # =========================================================================
     # Resilient State Synchronization Helpers
     # =========================================================================

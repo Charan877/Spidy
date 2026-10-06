@@ -94,12 +94,7 @@ export const CinematicCamera: React.FC<CinematicCameraProps> = ({
 
   useFrame((state, delta) => {
     const t = state.clock.getElapsedTime();
-    const { pos: basePos, lookAt: baseLookAt } =
-      isComplete || phase === 'COMPLETE'
-        ? { pos: new THREE.Vector3(0, 1.8, 13.0), lookAt: new THREE.Vector3(0, 0.3, 0) }
-        : isBuilding
-        ? getBuildPhaseTarget()
-        : getScrollWaypoints(scrollProgress);
+    const { pos: basePos, lookAt: baseLookAt } = getScrollWaypoints(scrollProgress);
 
     if (prefersReducedMotion) {
       camera.position.lerp(basePos, delta * 3.0);

@@ -18,6 +18,7 @@ from backend.runtime.environment_detector import EnvironmentDetector
 from backend.runtime.preview_manager import PreviewManager, PreviewCheckResult
 from backend.runtime.process_manager import ProcessManager, verify_process_port_ownership
 from backend.runtime.runtime_session import SPIDY_CONTROL_PORTS, NOVA_CONTROL_PORTS, RuntimeSession
+from backend.verification.gate_evaluator import GateEvaluator
 
 
 class ProjectRunner:
@@ -31,6 +32,10 @@ class ProjectRunner:
 
     def run(self, state: ProjectState) -> bool:
         """Detect stack, install dependencies, start session, and verify application."""
+        if hasattr(state, "can_execute_engineering") and not state.can_execute_engineering():
+            state.add_activity("Runtime launch blocked: execution prohibited while awaiting user confirmation.", level="bad")
+            return False
+
         state.runtime_status = "DETECTING"
         state.is_app_verified = False
         state.project_success = False
@@ -53,13 +58,15 @@ class ProjectRunner:
         state.project_type = env_config["project_type"]
         if is_planned_fullstack:
             state.runtime_type = "fullstack"
+        elif getattr(state, "runtime_type", "") == "web_3d":
+            state.runtime_type = "web_3d"
         else:
             state.runtime_type = env_config.get("runtime_type", "web" if env_config.get("is_web") else "cli")
         state.runtime_targets = []
         state.runtime_command = " ".join(env_config["command"]) if env_config.get("command") else ""
         state.runtime_port = env_config.get("port")
         state.runtime_url = env_config.get("url")
-        state.is_web_project = env_config["is_web"]
+        state.is_web_project = env_config["is_web"] or (state.runtime_type in ("web", "web_3d", "fullstack"))
         state.runtime_cwd = env_config.get("cwd", str(self.workspace.root))
 
         if state.runtime_type == "fullstack":
@@ -198,12 +205,49 @@ class ProjectRunner:
                     exit_code = session.process.poll() if session.process else -1
                     stderr_lines = [l for l in session.stderr_lines if l.strip()]
                     last_err = stderr_lines[-1] if stderr_lines else "Process terminated without output."
+                    full_stderr = "\n".join(stderr_lines)
+
+                    # Evidence-based recovery 1: Missing Dependency (ModuleNotFoundError / ImportError)
+                    missing_mod_match = re.search(r"(?:No module named|ModuleNotFoundError: No module named)\s+['\"]([^'\"]+)['\"]", full_stderr)
+                    if missing_mod_match and getattr(state, "_dep_install_retries", 0) < 1:
+                        state._dep_install_retries = getattr(state, "_dep_install_retries", 0) + 1
+                        missing_mod = missing_mod_match.group(1).split(".")[0]
+                        state.add_activity(f"Evidence-based recovery: Detected missing dependency '{missing_mod}'. Installing via pip...", level="run")
+                        pip_cmd = [sys.executable, "-m", "pip", "install", missing_mod]
+                        try:
+                            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                            subprocess.run(pip_cmd, capture_output=True, timeout=60.0, creationflags=creationflags)
+                            state.add_activity(f"Installed '{missing_mod}'. Retrying process startup...", level="ok")
+                            self.stop(state)
+                            return self.run(state)
+                        except Exception as e:
+                            state.add_activity(f"Failed to install '{missing_mod}': {e}", level="bad")
+
                     state.failure_classification = "PROCESS_CRASHED"
                     state.failure_reason = f"Process exited with code {exit_code}: {last_err}"
                     state.add_activity(f"RUNTIME FAILURE: Process exited prematurely (exit code {exit_code})", level="bad")
                     if last_err:
                         state.add_activity(f"Error detail: {last_err[:250]}", level="bad")
                 else:
+                    # Evidence-based recovery 2: Port collision / in-use
+                    occupied = getattr(session, "occupied_ports_seen", [])
+                    if occupied and getattr(state, "_port_retry_attempts", 0) < 2:
+                        state._port_retry_attempts = getattr(state, "_port_retry_attempts", 0) + 1
+                        from backend.runtime.environment_detector import find_free_port
+                        alt_port = find_free_port(start_port=8100, max_port=8999)
+                        state.add_activity(f"Evidence-based recovery: Port collision on {occupied}. Switching to alternate port {alt_port}...", level="run")
+                        self.stop(state)
+                        env_config["port"] = alt_port
+                        if "command" in env_config:
+                            new_cmd = []
+                            for part in env_config["command"]:
+                                if any(str(p) in str(part) for p in occupied):
+                                    new_cmd.append(str(alt_port))
+                                else:
+                                    new_cmd.append(part)
+                            env_config["command"] = new_cmd
+                        return self.run(state)
+
                     state.failure_classification = "PORT_NOT_DETECTED" if not target_port else "WRONG_RUNTIME_PROCESS"
                     state.failure_reason = (
                         f"Port detection failed (no listening socket on PID {session.pid}) or port {target_port} is in SPIDY control range."
@@ -336,7 +380,16 @@ class ProjectRunner:
                     except Exception:
                         pass
 
-                if check_result.is_app_verified:
+                # Authoritative Gate 6: Domain-specific & real browser verification
+                app_gate_res = GateEvaluator.evaluate_application(
+                    runtime_type=state.runtime_type,
+                    check_result=check_result,
+                    workspace_dir=self.workspace.root,
+                    state=state,
+                    preview_manager=self.preview_manager,
+                )
+
+                if app_gate_res.passed:
                     session.status = "APPLICATION_VERIFIED"
                     state.verification_gates["application"] = True
                     state.runtime_verification_steps.append("Application verified")
@@ -536,9 +589,17 @@ class ProjectRunner:
                     session.status = "FAILED"
                     state.is_app_verified = False
                     state.project_success = False
-                    state.failure_classification = check_result.classification
-                    state.failure_reason = check_result.message
-                    state.add_activity(f"Application verification failed: {check_result.message}", level="bad")
+                    state.verification_gates["application"] = False
+                    browser_ev = app_gate_res.evidence.get("browser_verification", {})
+                    state.failure_classification = browser_ev.get("classification") or "BROWSER_VERIFICATION_FAILED"
+                    state.failure_reason = app_gate_res.reason or check_result.message
+                    state.add_activity(f"Application verification failed: {state.failure_reason}", level="bad")
+                    if browser_ev.get("uncaught_exceptions"):
+                        for unc_err in browser_ev["uncaught_exceptions"]:
+                            state.errors.append(f"Browser Uncaught Exception: {unc_err}")
+                    if browser_ev.get("console_errors"):
+                        for c_err in browser_ev["console_errors"]:
+                            state.errors.append(f"Browser Console Error: {c_err}")
             else:
                 state.runtime_status = "FAILED"
                 session.status = "FAILED"
@@ -560,8 +621,23 @@ class ProjectRunner:
                     state.add_activity(f"RUNTIME FAILURE: HTTP readiness failed on port {target_port}: {check_result.message} ({check_result.classification})", level="bad")
 
         else:
-            state.runtime_status = "RUNNING"
-            session.status = "RUNNING"
+            # Non-web application (CLI, script, library)
+            time.sleep(0.5)
+            exit_code = session.process.poll() if session.process else 0
+            if exit_code is not None and exit_code != 0:
+                stderr_lines = [l for l in session.stderr_lines if l.strip()]
+                last_err = stderr_lines[-1] if stderr_lines else "Process exited with non-zero status code."
+                state.runtime_status = "FAILED"
+                session.status = "FAILED"
+                state.is_app_verified = False
+                state.project_success = False
+                state.failure_classification = "PROCESS_CRASHED"
+                state.failure_reason = f"CLI process exited with code {exit_code}: {last_err}"
+                state.add_activity(f"CLI process failed with exit code {exit_code}: {last_err[:200]}", level="bad")
+                return False
+
+            state.runtime_status = "RUNNING" if exit_code is None else "STOPPED"
+            session.status = "RUNNING" if exit_code is None else "COMPLETED"
             state.is_app_verified = True
             state.project_success = True
             state.verification_gates["server"] = True

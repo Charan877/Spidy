@@ -3,8 +3,10 @@
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, MagicMock
+import uuid
 from starlette.testclient import TestClient
 
 from backend.core.project_state import ProjectState, Task
@@ -86,36 +88,40 @@ class TestServerResumeAndRecovery(unittest.TestCase):
     def test_api_resume_project_restores_context_and_tasks(self):
         """POST /api/projects/{id}/resume must reconstruct real state, tasks, and gates."""
         with tempfile.TemporaryDirectory() as tmp_dir:
+            test_tag = uuid.uuid4().hex[:6]
+            proj_id = f"proj_test_resume_{test_tag}"
+            build_id = f"bld_test_resume_{test_tag}"
+
             # Create a mock project workspace with real files
-            proj_ws = WorkspaceManager.for_project("proj_test_resume_01")
+            proj_ws = WorkspaceManager.for_project(proj_id)
             proj_ws.write_file("main.py", "print('hello world')")
             proj_ws.write_file("README.md", "# Test Project\nFunctional documentation")
 
             db_mgr = server.db_manager
             db_mgr.sync_project_and_build_start(
-                project_id="proj_test_resume_01",
+                project_id=proj_id,
                 project_name="Resume Test App",
-                build_id="bld_test_resume_01",
+                build_id=build_id,
                 requirement="Build and resume a verified project",
                 detected_stack="Python",
                 workspace_path=str(proj_ws.root),
             )
-            db_mgr.sync_verification_gate("bld_test_resume_01", "build", "PASSED", "All files built")
+            db_mgr.sync_verification_gate(build_id, "build", "PASSED", "All files built")
             db_mgr.sync_build_finish(
-                build_id="bld_test_resume_01",
-                project_id="proj_test_resume_01",
+                build_id=build_id,
+                project_id=proj_id,
                 status="COMPLETED",
                 final_result="Success",
             )
 
             # Invoke resume endpoint
-            res = self.client.post("/api/projects/proj_test_resume_01/resume")
+            res = self.client.post(f"/api/projects/{proj_id}/resume")
             self.assertEqual(res.status_code, 200)
 
             # Inspect state
             with server.state_lock:
-                self.assertEqual(server.state.project_id, "proj_test_resume_01")
-                self.assertEqual(server.state.build_id, "bld_test_resume_01")
+                self.assertEqual(server.state.project_id, proj_id)
+                self.assertEqual(server.state.build_id, build_id)
                 self.assertEqual(server.state.current_phase, "COMPLETE")
                 self.assertTrue(server.state.project_success)
                 self.assertIn("main.py", server.state.files)
@@ -203,7 +209,54 @@ class TestServerResumeAndRecovery(unittest.TestCase):
         with server.state_lock:
             server.state.is_running = False
 
+    def test_pipeline_failure_is_strictly_classified_and_never_interrupted(self):
+        """Under no circumstances should an agent error, exception, or runtime verification failure become INTERRUPTED."""
+        st = ProjectState()
+        st.is_running = True
+        st.fail("Runtime test suite failed", classification="TEST_FAILURE")
+        self.assertEqual(st.current_phase, "FAILED")
+        self.assertEqual(st.project_state, "FAILED")
+        self.assertEqual(st.failure_classification, "TEST_FAILURE")
+        self.assertNotEqual(st.failure_classification, "EXECUTION_INTERRUPTED")
 
+    def test_generation_gate_scoping_ignores_downstream_task_statuses(self):
+        """Generation Gate must only evaluate BUILD phase tasks, not downstream RUN or TEST tasks."""
+        st = ProjectState()
+        st.build_id = "bld_gate_test_01"
+        st.add_task("t-1", "Generate main.py", "BUILD", is_required=True, build_id="bld_gate_test_01")
+        st.complete_task("t-1")
+        st.add_task("t-run", "Launch server", "RUN", is_required=True, build_id="bld_gate_test_01")
+        st.fail_task("t-run", "Runtime failure from previous cycle")
+
+        # Scoped to BUILD: must be False
+        self.assertFalse(st.has_failed_required_tasks(phase="BUILD"))
+        # Unscoped: checks all phases, returns True
+        self.assertTrue(st.has_failed_required_tasks())
+
+    def test_process_manager_wait_for_port_does_not_return_prematurely_when_unbound(self):
+        """wait_for_port must not immediately return an explicit port if no process is listening."""
+        from backend.runtime.process_manager import ProcessManager
+        from backend.runtime.runtime_session import RuntimeSession
+
+        pm = ProcessManager()
+        # Create a mock session with an explicit port that is definitely not listening
+        session = RuntimeSession(
+            command=["mock"],
+            cwd=".",
+            port=59999,
+        )
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # Process is alive
+        session.process = mock_proc
+        session.pid = 999999
+
+        # wait_for_port with short timeout must timeout and return None, NOT return 59999 immediately
+        start_t = time.time()
+        detected = pm.wait_for_port(session, timeout=0.6)
+        elapsed = time.time() - start_t
+
+        self.assertIsNone(detected, "Must return None when port is not actually listening")
+        self.assertGreaterEqual(elapsed, 0.4, "Must wait rather than returning instantly")
 
 
 if __name__ == "__main__":

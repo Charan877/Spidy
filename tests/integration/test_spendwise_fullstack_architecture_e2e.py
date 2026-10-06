@@ -38,6 +38,7 @@ class TestSpendWiseFullstackArchitectureE2E(unittest.TestCase):
         )
         self.state.project_id = "proj_spendwise_test"
         self.state.build_id = "bld_spendwise_001"
+        self.state.auto_confirm = True
 
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)

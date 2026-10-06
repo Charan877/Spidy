@@ -51,7 +51,7 @@ export const FailureView: React.FC<FailureViewProps> = ({
             </div>
             <div>
               <span className="text-slate-500 uppercase">Status:</span>{' '}
-              <span className="text-rose-400 font-semibold">{state.runtime_status || 'INTERRUPTED'}</span>
+              <span className="text-rose-400 font-semibold">{state.runtime_status || (isInterrupted ? 'INTERRUPTED' : 'FAILED')}</span>
             </div>
             {state.runtime_command && (
               <div className="col-span-2 truncate">

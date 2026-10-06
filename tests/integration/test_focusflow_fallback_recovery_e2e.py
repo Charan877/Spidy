@@ -44,6 +44,7 @@ class TestFocusFlowFallbackRecoveryE2E(unittest.TestCase):
         self.state.project_id = "proj_focusflow_test"
         self.state.build_id = "bld_focusflow_001"
         self.state.user_approved = True
+        self.state.auto_confirm = True
 
     def tearDown(self):
         if hasattr(self, "runner"):

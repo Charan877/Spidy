@@ -288,7 +288,7 @@ def render_failure_view(state: ProjectState) -> None:
     """Renders the restrained interruption screen when a pipeline stage or runtime halts."""
     col_left, col_right = st.columns([1.1, 1.3], gap="large")
 
-    classification = state.failure_classification or "EXECUTION_INTERRUPTED"
+    classification = state.failure_classification or "EXECUTION_FAILURE"
     reason = state.failure_reason or "Verification check did not satisfy prerequisite conditions."
 
     is_interrupted = state.failure_classification in ("EXECUTION_INTERRUPTED", "SERVER_RESTARTED_MID_BUILD", "USER_CANCELLED")

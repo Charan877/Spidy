@@ -55,6 +55,13 @@ class BaseAgent:
         **kwargs,
     ) -> Any:
         """Standardized lifecycle execution wrapper around an agent action."""
+        if hasattr(state, "can_execute_engineering") and not state.can_execute_engineering():
+            block_msg = f"{self.name} blocked: execution prohibited while awaiting user confirmation."
+            state.add_activity(block_msg, level="bad")
+            if task_id:
+                state.block_task(task_id, "Awaiting user confirmation")
+            return None
+
         self.set_status("WORKING", state)
         state.add_activity(f"{self.name} activated ({self.role})", level="run")
 
@@ -77,6 +84,10 @@ class BaseAgent:
 
         try:
             result = action_fn(state, *args, **kwargs)
+            if hasattr(state, "is_awaiting_confirmation") and state.is_awaiting_confirmation():
+                self.set_status("READY", state)
+                return result
+
             self.set_status("SUCCESS", state)
             state.add_activity(f"{self.name} completed task successfully", level="ok")
             if task_id:

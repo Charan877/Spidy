@@ -22,6 +22,50 @@ def get_process_tree_pids(root_pid: int) -> Set[int]:
     tree = {root_pid}
     if sys.platform == "win32":
         try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            h_snap = ctypes.windll.kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+            if h_snap != -1:
+                pe = PROCESSENTRY32()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                parent_map: Dict[int, List[int]] = {}
+                if ctypes.windll.kernel32.Process32First(h_snap, ctypes.byref(pe)):
+                    while True:
+                        pid = int(pe.th32ProcessID)
+                        ppid = int(pe.th32ParentProcessID)
+                        parent_map.setdefault(ppid, []).append(pid)
+                        if not ctypes.windll.kernel32.Process32Next(h_snap, ctypes.byref(pe)):
+                            break
+                ctypes.windll.kernel32.CloseHandle(h_snap)
+
+                queue = [root_pid]
+                while queue:
+                    curr = queue.pop(0)
+                    for child in parent_map.get(curr, []):
+                        if child not in tree:
+                            tree.add(child)
+                            queue.append(child)
+                return tree
+        except Exception:
+            pass
+
+        # Fallback to PowerShell if ctypes snapshot fails
+        try:
             cmd = [
                 "powershell",
                 "-NoProfile",
@@ -42,7 +86,6 @@ def get_process_tree_pids(root_pid: int) -> Set[int]:
                     pid, ppid = int(parts[0]), int(parts[1])
                     parent_map.setdefault(ppid, []).append(pid)
 
-            # BFS to gather all descendant PIDs
             queue = [root_pid]
             while queue:
                 curr = queue.pop(0)
@@ -240,7 +283,7 @@ class ProcessManager:
                 session.add_stderr(f"Process terminated prematurely (exit code {exit_code}).")
                 return None
 
-            # 1. If dev server logged port via stdout (session.port is populated)
+            # 1. If a port is registered on session, verify whether it is genuinely listening and owned
             if session.port:
                 owner_pid = get_port_owner_pid(session.port)
                 if owner_pid:
@@ -256,22 +299,22 @@ class ProcessManager:
                         session.occupied_ports_seen.append(session.port)
                         session.port = None
                         session.url = None
-                else:
-                    # In dev servers (Vite/Streamlit) or mock sessions, return logged port once detected in stdout
-                    if session.port:
-                        session.status = "PORT_DETECTED"
-                        return session.port
+                        session.port_detected_from_stream = False
+                elif getattr(session, "port_detected_from_stream", False):
+                    session.status = "PORT_DETECTED"
+                    return session.port
 
             # 2. Check if process tree is listening on ANY socket
             if session.pid:
                 detected = discover_ports_by_pid(session.pid)
                 if detected:
-                    session.port = detected[0]
-                    session.url = f"http://localhost:{detected[0]}"
+                    chosen_port = session.port if (session.port and session.port in detected) else detected[0]
+                    session.port = chosen_port
+                    session.url = f"http://localhost:{chosen_port}"
                     session.status = "PORT_DETECTED"
-                    return detected[0]
+                    return chosen_port
 
-            time.sleep(0.15)
+            time.sleep(0.2)
 
         return None
 

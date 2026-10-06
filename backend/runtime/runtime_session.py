@@ -47,6 +47,7 @@ class RuntimeSession:
     error_message: Optional[str] = None
     is_app_verified: bool = False
     occupied_ports_seen: List[int] = field(default_factory=list)
+    port_detected_from_stream: bool = False
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -77,6 +78,7 @@ class RuntimeSession:
             if self.port == occ_port:
                 self.port = None
                 self.url = None
+                self.port_detected_from_stream = False
             return
 
         # 2. Match URLs from dev servers (Vite, Next, React Scripts, Webpack, etc.)
@@ -97,6 +99,7 @@ class RuntimeSession:
                     if 1024 <= p <= 65535 and p not in NOVA_CONTROL_PORTS and p not in self.occupied_ports_seen:
                         self.port = p
                         self.url = f"http://localhost:{p}"
+                        self.port_detected_from_stream = True
                         if self.status in ("NOT_STARTED", "STARTING", "PROCESS_STARTED"):
                             self.status = "PORT_DETECTED"
                         return
@@ -121,13 +124,14 @@ class RuntimeSession:
                 try:
                     if sys.platform == "win32":
                         # Windows taskkill with /T (tree kill) and /F (force) ensures child node.exe processes die
-                        subprocess.run(
-                            ["taskkill", "/F", "/T", "/PID", str(pid)],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                            timeout=5,
-                        )
+                        if pid and pid > 4:
+                            subprocess.run(
+                                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=subprocess.CREATE_NO_WINDOW,
+                                timeout=5,
+                            )
                     else:
                         self.process.terminate()
                         self.process.wait(timeout=3)

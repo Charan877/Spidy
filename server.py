@@ -10,6 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import threading
 import socket
 import sys
@@ -38,6 +39,7 @@ from backend.runtime.project_runner import ProjectRunner
 from backend.core.project_state import ProjectState, Task, ActivityLog
 from backend.core.workspace_manager import WorkspaceManager
 from backend.runtime.process_manager import ProcessManager
+from backend.core.semantic_requirement import SemanticRequirementAnalyzer, EngineeringSpecification
 
 load_dotenv()
 
@@ -54,15 +56,15 @@ except Exception as _db_init_err:
 runner = ProjectRunner(workspace, process_manager)
 pipeline = MultiAgentPipeline(workspace, runner)
 state = ProjectState()
-state.files = workspace.load_all_files()
+state.files = {}
 state.db_manager = db_manager
 try:
     get_model_router().set_fallback_callback(lambda msg, lvl: state.add_activity(msg, level=lvl))
 except Exception:
     pass
 
-# Thread-safety lock for state mutations
-state_lock = threading.Lock()
+# Thread-safety re-entrant lock for state mutations
+state_lock = threading.RLock()
 build_thread: threading.Thread = None
 
 
@@ -226,6 +228,7 @@ def restore_project_state(
                     pass
 
             # Check runtime sessions
+            b_status = latest_build.get("status") if latest_build else ("COMPLETED" if files else "IDLE")
             if build_id:
                 try:
                     runtimes = db_mgr.runtimes.get_sessions_for_build(build_id)
@@ -237,17 +240,18 @@ def restore_project_state(
                             target_state.runtime_port = latest_rt.get("port")
                             target_state.runtime_url = latest_rt.get("url")
                             target_state.runtime_status = "RUNNING"
-                            target_state.is_app_verified = True
+                            app_gate_ok = target_state.verification_gates.get("application", False)
+                            target_state.is_app_verified = (b_status == "COMPLETED" and app_gate_ok)
                         else:
                             target_state.runtime_pid = None
                             target_state.runtime_port = latest_rt.get("port")
                             target_state.runtime_url = latest_rt.get("url")
                             target_state.runtime_status = "STOPPED"
+                            target_state.is_app_verified = False
                 except Exception:
                     pass
 
             # Synchronize final phase and project_state
-            b_status = latest_build.get("status") if latest_build else ("COMPLETED" if files else "IDLE")
             if b_status == "COMPLETED":
                 target_state.current_phase = "COMPLETE"
                 target_state.project_state = "SUCCESS"
@@ -259,8 +263,9 @@ def restore_project_state(
                 target_state.current_phase = "FAILED"
                 target_state.project_state = "FAILED"
                 target_state.project_success = False
+                target_state.is_app_verified = False
                 target_state.failure_classification = "EXECUTION_INTERRUPTED"
-                target_state.failure_reason = latest_build.get("failure_reason") or "Build interrupted unexpectedly"
+                target_state.failure_reason = latest_build.get("failure_reason") or "Build was interrupted before completion"
                 target_state.errors = [target_state.failure_reason]
             elif b_status == "FAILED":
                 target_state.current_phase = "FAILED"
@@ -322,6 +327,11 @@ def reconcile_startup_state(db_mgr: Optional[Any], p_runner: ProjectRunner, p_pi
             latest_pid = projects[0].get("project_id")
             if latest_pid:
                 restore_project_state(latest_pid, target_state, db_mgr, p_runner, p_pipeline)
+                if target_state.failure_classification in ("EXECUTION_INTERRUPTED", "SERVER_RESTARTED_MID_BUILD"):
+                    target_state.reset()
+        else:
+            target_state.reset()
+            clear_active_context()
     except Exception as exc:
         logging.getLogger("spidy.server").warning(f"Error reconciling startup state: {exc}")
 
@@ -388,65 +398,110 @@ def hooked_add_activity(message: str, level: str = "ok") -> None:
 state.add_activity = hooked_add_activity
 
 
-# Background Build Worker
-# Background Build Worker
-def _run_build_worker(goal: str, language: str, project_id: Optional[str] = None) -> None:
+# Background Workers: Understanding vs Engineering Execution
+def _run_understanding_worker(goal: str, language: str, project_id: Optional[str] = None, build_id: Optional[str] = None) -> None:
+    """Non-executing requirement understanding worker: prepares EngineeringSpecification and gates confirmation."""
     global state
-    if project_id and project_id != "spidy-default":
-        target_pid = project_id
-        project_name = getattr(state, "project_name", "SPIDY Project") or "SPIDY Project"
-    else:
-        target_pid = f"proj_{int(time.time())}_{uuid.uuid4().hex[:4]}"
-        project_name = "SPIDY Project"
 
-    build_id = f"bld_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    active_ctx = ActiveProjectContext.create_new(
-        project_name=project_name,
-        project_id=target_pid,
-        build_id=build_id,
-    )
-    set_active_context(active_ctx)
+    target_pid = project_id or getattr(state, "project_id", None) or f"proj_{int(time.time())}_{uuid.uuid4().hex[:4]}"
+    current_bid = build_id or getattr(state, "build_id", None) or f"bld_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+
+    def is_current() -> bool:
+        with state_lock:
+            return getattr(state, "build_id", None) == current_bid
 
     # Workspace isolation per project
     project_ws = WorkspaceManager.for_project(target_pid)
     runner.workspace = project_ws
     pipeline.workspace = project_ws
 
-    with state_lock:
-        state.reset(new_goal=goal, language=language, project_id=target_pid, build_id=build_id)
-        state.conversation_id = active_ctx.conversation_id
-        state.active_context = active_ctx
-        state.db_manager = db_manager
-        state.build_start_time = time.time()
-        state.is_running = True
-
     try:
-        db_manager.sync_project_and_build_start(
-            project_id=target_pid,
-            project_name=project_name,
-            build_id=build_id,
-            requirement=goal,
-            detected_stack=language,
-            workspace_path=str(project_ws.root),
-            estimated_duration=state.estimated_duration_str,
-        )
-    except Exception as _sync_err:
-        logging.getLogger("spidy.server").warning(f"Error syncing build start to SQLite: {_sync_err}")
-
-    broadcast_state_sync()
-
-    try:
-        pipeline.analyze_and_plan(state)
+        confirmed = pipeline.understand_requirement(state)
+        if not is_current():
+            return
         broadcast_state_sync()
 
-        if state.user_approved:
-            pipeline.execute_build(state)
+        # If confirmation is required, stop immediately. Do NOT run engineering worker.
+        if state.is_awaiting_confirmation() or not confirmed:
+            with state_lock:
+                state.is_running = False
             broadcast_state_sync()
-            final_status = "COMPLETED" if state.project_success else ("FAILED" if (state.errors or state.failure_reason) else "FINISHED")
-            duration = time.time() - state.build_start_time if state.build_start_time else None
+            return
+
+        # If auto-confirmed (e.g. automated test suites), proceed to engineering worker
+        _run_engineering_worker(target_pid, current_bid)
+    except Exception as exc:
+        if is_current():
+            with state_lock:
+                state.fail(f"Requirement understanding failed: {exc}")
+                state.is_running = False
+            broadcast_state_sync()
+    finally:
+        if is_current() and state.is_awaiting_confirmation():
+            with state_lock:
+                state.is_running = False
+            broadcast_state_sync()
+
+
+def _run_engineering_worker(project_id: Optional[str] = None, build_id: Optional[str] = None) -> None:
+    """Authoritative engineering execution worker: runs ONLY after requirement confirmation."""
+    global state
+
+    target_pid = project_id or getattr(state, "project_id", None) or "spidy-default"
+    current_bid = build_id or getattr(state, "build_id", None) or ""
+
+    def is_current() -> bool:
+        with state_lock:
+            return not current_bid or getattr(state, "build_id", None) == current_bid
+
+    # Hard barrier check: refuse execution if awaiting confirmation
+    if state.is_awaiting_confirmation() or not state.can_execute_engineering():
+        with state_lock:
+            state.is_running = False
+            state.add_activity("Engineering execution blocked: confirmation barrier is active.", level="bad")
+        broadcast_state_sync()
+        return
+
+    # Workspace isolation per project
+    project_ws = WorkspaceManager.for_project(target_pid)
+    runner.workspace = project_ws
+    pipeline.workspace = project_ws
+
+    try:
+        with state_lock:
+            state.is_running = True
+        broadcast_state_sync()
+
+        is_mod = (
+            getattr(state, "pending_intent", "NEW_PROJECT") == "MODIFICATION"
+            or (isinstance(state.engineering_spec, dict) and state.engineering_spec.get("is_modification", False))
+        )
+
+        if is_mod:
+            pipeline.execute_conversational_turn(state, state.goal, selected_language=state.selected_language)
+            if not is_current():
+                return
+            broadcast_state_sync()
+        else:
+            pipeline.plan_and_architect(state)
+            if not is_current():
+                return
+            broadcast_state_sync()
+
+            pipeline.execute_build(state)
+            if not is_current():
+                return
+            broadcast_state_sync()
+
+        with state_lock:
+            state.pending_confirmation_id = None
+
+        final_status = "COMPLETED" if state.project_success else ("FAILED" if (state.errors or state.failure_reason) else "FINISHED")
+        duration = time.time() - state.build_start_time if state.build_start_time else None
+        if db_manager and current_bid:
             try:
                 db_manager.sync_build_finish(
-                    build_id=build_id,
+                    build_id=current_bid,
                     project_id=target_pid,
                     status=final_status,
                     duration=duration,
@@ -456,38 +511,35 @@ def _run_build_worker(goal: str, language: str, project_id: Optional[str] = None
                 )
             except Exception:
                 pass
-        else:
-            try:
-                db_manager.sync_activity(
-                    build_id=build_id,
-                    message="Plan generated. Waiting for user approval.",
-                    event_type="WAITING",
-                    agent="Orchestrator",
-                    status="WAITING_FOR_USER",
-                )
-            except Exception:
-                pass
     except Exception as exc:
-        with state_lock:
-            state.fail(f"Build failed with exception: {exc}")
-            state.is_running = False
-        duration = time.time() - state.build_start_time if state.build_start_time else None
-        try:
-            db_manager.sync_build_finish(
-                build_id=build_id,
-                project_id=target_pid,
-                status="FAILED",
-                duration=duration,
-                failure_reason=str(exc),
-                detected_stack=state.effective_language,
-            )
-        except Exception:
-            pass
-        broadcast_state_sync()
+        if is_current():
+            with state_lock:
+                state.fail(f"Engineering build failed with exception: {exc}")
+                state.is_running = False
+            duration = time.time() - state.build_start_time if state.build_start_time else None
+            if db_manager and current_bid:
+                try:
+                    db_manager.sync_build_finish(
+                        build_id=current_bid,
+                        project_id=target_pid,
+                        status="FAILED",
+                        duration=duration,
+                        failure_reason=str(exc),
+                        detected_stack=state.effective_language,
+                    )
+                except Exception:
+                    pass
+            broadcast_state_sync()
     finally:
-        with state_lock:
-            state.is_running = False
-        broadcast_state_sync()
+        if is_current():
+            with state_lock:
+                state.is_running = False
+            broadcast_state_sync()
+
+
+def _run_build_worker(goal: str, language: str, project_id: Optional[str] = None, build_id: Optional[str] = None) -> None:
+    """Legacy alias: routes cleanly to understanding worker with confirmation barrier."""
+    _run_understanding_worker(goal=goal, language=language, project_id=project_id, build_id=build_id)
 
 
 # REST Handlers
@@ -501,6 +553,7 @@ async def api_post_build(request):
     data = await request.json()
     goal = (data.get("goal") or "").strip()
     language = data.get("language", "Auto Detect")
+    auto_confirm = data.get("auto_confirm", False)
 
     if not goal:
         return JSONResponse({"error": "Please provide a programming requirement."}, status_code=400)
@@ -513,27 +566,168 @@ async def api_post_build(request):
         )
 
     project_id = data.get("project_id")
-    # If a build is currently recorded as running, stop it and start the requested build cleanly
-    if state.is_running:
-        if build_thread is not None and build_thread.is_alive():
-            try:
-                runner.stop(state)
-                pipeline.workspace.clear_workspace()
-            except Exception:
-                pass
-        with state_lock:
-            state.is_running = False
+    has_existing = bool(
+        project_id
+        and project_id != "spidy-default"
+        and db_manager
+        and db_manager.projects.get_project(project_id)
+    )
+    existing_files_count = len(WorkspaceManager.for_project(project_id).list_files()) if has_existing else 0
+    classification = TaskClassifier.classify(
+        message=goal,
+        has_existing_project=has_existing,
+        existing_files_count=existing_files_count,
+    )
 
-    build_thread = threading.Thread(target=_run_build_worker, args=(goal, language, project_id), daemon=True)
+    if classification == TaskClassification.NEW_PROJECT or not has_existing:
+        target_pid = f"proj_{int(time.time())}_{uuid.uuid4().hex[:4]}"
+        project_name = "SPIDY Project"
+        is_mod = False
+    else:
+        target_pid = project_id
+        project_name = getattr(state, "project_name", "SPIDY Project") or "SPIDY Project"
+        is_mod = True
+
+    build_id = f"bld_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    active_ctx = ActiveProjectContext.create_new(
+        project_name=project_name,
+        project_id=target_pid,
+        build_id=build_id,
+    )
+    set_active_context(active_ctx)
+
+    # Stop any active runtime session
+    if state.is_running:
+        try:
+            runner.stop(state)
+        except Exception:
+            pass
+
+    project_ws = WorkspaceManager.for_project(target_pid)
+    runner.workspace = project_ws
+    pipeline.workspace = project_ws
+
+    with state_lock:
+        state.reset(new_goal=goal, language=language, project_id=target_pid, build_id=build_id)
+        state.auto_confirm = auto_confirm
+        state.conversation_id = active_ctx.conversation_id
+        state.active_context = active_ctx
+        state.db_manager = db_manager
+        state.build_start_time = time.time()
+        state.project_state = "UNDERSTANDING"
+        state.interpretation_status = "PENDING"
+        state.pending_intent = "MODIFICATION" if is_mod else "NEW_PROJECT"
+        state.pending_target_project_id = target_pid
+        state.pending_requirement = goal
+        state.user_approved = False
+        state.is_running = True
+
+    try:
+        if db_manager:
+            db_manager.sync_project_and_build_start(
+                project_id=target_pid,
+                project_name=project_name,
+                build_id=build_id,
+                requirement=goal,
+                detected_stack=language,
+                workspace_path=str(project_ws.root),
+                estimated_duration=state.estimated_duration_str,
+            )
+    except Exception as _sync_err:
+        logging.getLogger("spidy.server").warning(f"Error syncing build start to SQLite: {_sync_err}")
+
+    broadcast_state_sync()
+
+    build_thread = threading.Thread(
+        target=_run_understanding_worker,
+        args=(goal, language, target_pid, build_id),
+        daemon=True,
+    )
     build_thread.start()
 
-    return JSONResponse({"message": "Build started successfully.", "goal": goal, "language": language, "project_id": project_id})
+    return JSONResponse({"message": "Build started successfully.", "goal": goal, "language": language, "project_id": target_pid, "build_id": build_id})
 
 
 def _run_conversational_worker(message: str, project_id: Optional[str] = None, language: str = "Auto Detect") -> None:
     global state
 
-    # Pre-classify intent to check if this is an explicit or implicit NEW PROJECT
+    msg_lower = (message or "").strip().lower()
+    affirmative_patterns = [
+        r"^(yes|yep|yeah|confirm|confirmed|proceed|go ahead|looks good|start|ok|sure|build it|do it)\b",
+        r"that'?s\s+(what\s+i\s+want|correct|right)",
+        r"yes,\s*that'?s\s+what\s+i\s+want",
+    ]
+    is_affirmative = any(bool(re.search(pat, msg_lower)) for pat in affirmative_patterns)
+
+    # 1. Check affirmative responses
+    if is_affirmative:
+        if state.is_awaiting_confirmation():
+            with state_lock:
+                pipeline.confirm_interpretation(state)
+                state.is_running = True
+                target_pid = getattr(state, "project_id", "spidy-default")
+                current_bid = getattr(state, "build_id", "")
+            broadcast_state_sync()
+            _run_engineering_worker(target_pid, current_bid)
+            return
+        elif state.project_state == "WAITING_FOR_USER":
+            with state_lock:
+                state.clarification_answers[f"answer_{len(state.clarification_answers)+1}"] = message
+                state.release_from_user("ENGINEERING_READY")
+                state.is_running = True
+                target_pid = getattr(state, "project_id", "spidy-default")
+                current_bid = getattr(state, "build_id", "")
+            broadcast_state_sync()
+            _run_engineering_worker(target_pid, current_bid)
+            return
+        else:
+            with state_lock:
+                state.add_activity("No requirement is currently awaiting confirmation. Please tell me what you would like to build or modify.", level="dim")
+                state.is_running = False
+            broadcast_state_sync()
+            return
+
+    # Check if currently waiting for user input
+    if state.project_state == "WAITING_FOR_USER":
+        with state_lock:
+            state.clarification_answers[f"answer_{len(state.clarification_answers)+1}"] = message
+            state.release_from_user("ENGINEERING_READY")
+            state.is_running = True
+            target_pid = getattr(state, "project_id", "spidy-default")
+            current_bid = getattr(state, "build_id", "")
+        broadcast_state_sync()
+        _run_engineering_worker(target_pid, current_bid)
+        return
+
+    # 2. Check if we are currently awaiting user confirmation of a requirement interpretation
+    if state.is_awaiting_confirmation():
+        is_question = msg_lower.endswith("?") or bool(re.search(r"^(what|why|how|who|when|where|can you|could you|explain|tell me)\b", msg_lower))
+        is_correction = bool(re.search(r"\b(no|nope|not|change|modify|instead|update|rather|revise|prefer|use|switch|remove|add|replace)\b", msg_lower))
+        if is_question and not is_correction:
+            with state_lock:
+                state.add_activity(f"User asked: '{message}'", level="dim")
+                state.add_activity("Requirement remains awaiting confirmation. Confirm to begin implementation or request changes.", level="dim")
+                state.is_running = False
+            broadcast_state_sync()
+            return
+
+        # Treat as rejection/feedback to update the requirement interpretation
+        with state_lock:
+            raw_spec = state.engineering_spec or {}
+            spec = EngineeringSpecification.from_dict(raw_spec)
+            revised = SemanticRequirementAnalyzer.update_with_feedback(spec, message, is_rejection=True)
+            state.engineering_spec = revised.to_dict()
+            state.requirement_interpretation = revised.concise_interpretation
+            state.interpretation_status = "PENDING"
+            state.user_approved = False
+            state.goal = f"{state.original_goal or state.goal} (Updated: {message})"
+            state.add_activity(f"Interpretation revised based on feedback: '{message}'", level="ok")
+            state.transition_to("AWAITING_CONFIRMATION", f"Revised interpretation pending confirmation: {revised.concise_interpretation}")
+            state.is_running = False
+        broadcast_state_sync()
+        return
+
+    # 3. Pre-classify intent to check if this is an explicit or implicit NEW PROJECT
     has_existing = bool(
         project_id
         and project_id != "spidy-default"
@@ -548,10 +742,39 @@ def _run_conversational_worker(message: str, project_id: Optional[str] = None, l
     )
 
     if classification == TaskClassification.NEW_PROJECT or not has_existing:
-        # Route to fresh isolated build worker so new project lifecycle is clean
-        _run_build_worker(goal=message, language=language, project_id=None)
+        # Route to fresh isolated understanding worker so requirement is understood and gated
+        target_pid = f"proj_{int(time.time())}_{uuid.uuid4().hex[:4]}"
+        build_id = f"bld_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        active_ctx = ActiveProjectContext.create_new(
+            project_name="SPIDY Project",
+            project_id=target_pid,
+            build_id=build_id,
+        )
+        set_active_context(active_ctx)
+        project_ws = WorkspaceManager.for_project(target_pid)
+        runner.workspace = project_ws
+        pipeline.workspace = project_ws
+
+        with state_lock:
+            state.reset(new_goal=message, language=language, project_id=target_pid, build_id=build_id)
+            state.auto_confirm = False
+            state.conversation_id = active_ctx.conversation_id
+            state.active_context = active_ctx
+            state.db_manager = db_manager
+            state.build_start_time = time.time()
+            state.project_state = "UNDERSTANDING"
+            state.interpretation_status = "PENDING"
+            state.pending_intent = "NEW_PROJECT"
+            state.pending_target_project_id = target_pid
+            state.pending_requirement = message
+            state.user_approved = False
+            state.is_running = True
+
+        broadcast_state_sync()
+        _run_understanding_worker(goal=message, language=language, project_id=target_pid, build_id=build_id)
         return
 
+    # Genuine modification of active existing project: also route through understanding and confirmation gate!
     target_pid = project_id
     build_id = f"bld_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     active_ctx = ActiveProjectContext.create_new(
@@ -570,9 +793,16 @@ def _run_conversational_worker(message: str, project_id: Optional[str] = None, l
         state.build_id = build_id
         state.task_graph_id = f"tg_{build_id}"
         state.project_id = target_pid
+        state.goal = message
         state.active_context = active_ctx
         state.db_manager = db_manager
         state.build_start_time = time.time()
+        state.project_state = "UNDERSTANDING"
+        state.interpretation_status = "PENDING"
+        state.pending_intent = "MODIFICATION"
+        state.pending_target_project_id = target_pid
+        state.pending_requirement = message
+        state.user_approved = False
         state.is_running = True
         # Cleanly purge stale failed tasks so old build errors never fail new delta turn
         state.tasks = [t for t in state.tasks if t.status in ("SUCCESS", "completed")]
@@ -596,47 +826,7 @@ def _run_conversational_worker(message: str, project_id: Optional[str] = None, l
             logging.getLogger("spidy.server").warning(f"Error syncing conversational build start: {_sync_err}")
 
     broadcast_state_sync()
-
-    try:
-        pipeline.execute_conversational_turn(state, message, selected_language=language)
-        broadcast_state_sync()
-        final_status = "COMPLETED" if state.project_success else ("FAILED" if (state.errors or state.failure_reason) else "FINISHED")
-        duration = time.time() - state.build_start_time if state.build_start_time else None
-        if db_manager:
-            try:
-                db_manager.sync_build_finish(
-                    build_id=build_id,
-                    project_id=target_pid,
-                    status=final_status,
-                    duration=duration,
-                    final_result=state.architecture_summary or ("Success" if state.project_success else None),
-                    failure_reason=state.failure_reason,
-                    detected_stack=state.effective_language,
-                )
-            except Exception:
-                pass
-    except Exception as exc:
-        with state_lock:
-            state.fail(f"Conversational update failed: {exc}")
-            state.is_running = False
-        duration = time.time() - state.build_start_time if state.build_start_time else None
-        if db_manager:
-            try:
-                db_manager.sync_build_finish(
-                    build_id=build_id,
-                    project_id=target_pid,
-                    status="FAILED",
-                    duration=duration,
-                    failure_reason=str(exc),
-                    detected_stack=state.effective_language,
-                )
-            except Exception:
-                pass
-        broadcast_state_sync()
-    finally:
-        with state_lock:
-            state.is_running = False
-        broadcast_state_sync()
+    _run_understanding_worker(goal=message, language=language, project_id=target_pid, build_id=build_id)
 
 
 async def api_post_chat(request):
@@ -678,8 +868,22 @@ async def api_post_chat(request):
 
 async def api_post_stop(request):
     with state_lock:
-        runner.stop(state)
-        pipeline.workspace.clear_workspace()
+        bid = getattr(state, "build_id", None)
+        pid = getattr(state, "project_id", None)
+        if state.is_running and bid and pid and db_manager:
+            try:
+                db_manager.sync_build_interrupted(
+                    build_id=bid,
+                    project_id=pid,
+                    reason="User stopped build execution.",
+                )
+            except Exception:
+                pass
+        try:
+            runner.stop(state)
+            pipeline.workspace.clear_workspace()
+        except Exception:
+            pass
         state.reset()
     broadcast_state_sync()
     return JSONResponse({"message": "Workspace reset and processes terminated."})
@@ -693,50 +897,88 @@ async def api_post_approve(request):
     with state_lock:
         state.clarification_answers = answers
         state.user_approved = True
-
-    def _continue_after_approval():
-        build_id = getattr(state, "build_id", None)
+        if state.is_awaiting_confirmation():
+            pipeline.confirm_interpretation(state)
+        state.is_running = True
         project_id = getattr(state, "project_id", "spidy-default") or "spidy-default"
-        try:
-            pipeline.execute_build(state)
-            if db_manager and build_id:
-                final_status = "COMPLETED" if state.project_success else ("FAILED" if (state.errors or state.failure_reason) else "FINISHED")
-                duration = time.time() - state.build_start_time if state.build_start_time else None
-                try:
-                    db_manager.sync_build_finish(
-                        build_id=build_id,
-                        project_id=project_id,
-                        status=final_status,
-                        duration=duration,
-                        final_result=state.architecture_summary or ("Success" if state.project_success else None),
-                        failure_reason=state.failure_reason,
-                        detected_stack=state.effective_language,
-                    )
-                except Exception:
-                    pass
-        except Exception as exc:
-            if db_manager and build_id:
-                duration = time.time() - state.build_start_time if state.build_start_time else None
-                try:
-                    db_manager.sync_build_finish(
-                        build_id=build_id,
-                        project_id=project_id,
-                        status="FAILED",
-                        duration=duration,
-                        failure_reason=str(exc),
-                        detected_stack=state.effective_language,
-                    )
-                except Exception:
-                    pass
-        finally:
-            with state_lock:
-                state.is_running = False
-            broadcast_state_sync()
+        build_id = getattr(state, "build_id", None)
+    broadcast_state_sync()
 
-    build_thread = threading.Thread(target=_continue_after_approval, daemon=True)
+    build_thread = threading.Thread(
+        target=_run_engineering_worker,
+        args=(project_id, build_id),
+        daemon=True,
+    )
     build_thread.start()
 
     return JSONResponse({"message": "Approved. Build commenced."})
+
+
+async def api_post_confirm(request):
+    """Confirm the semantic requirement interpretation and begin execution."""
+    global build_thread
+    data = {}
+    try:
+        data = await request.json()
+    except Exception:
+        pass
+
+    with state_lock:
+        if not state.is_awaiting_confirmation():
+            return JSONResponse(
+                {"error": "No requirement interpretation is currently awaiting confirmation.", "status": "IGNORED"},
+                status_code=400,
+            )
+
+        req_pid = data.get("project_id")
+        if req_pid and state.project_id and req_pid != state.project_id:
+            return JSONResponse(
+                {"error": f"Confirmation project mismatch: requested {req_pid}, but pending is {state.project_id}."},
+                status_code=409,
+            )
+
+        pipeline.confirm_interpretation(state)
+        state.is_running = True
+        project_id = getattr(state, "project_id", "spidy-default") or "spidy-default"
+        build_id = getattr(state, "build_id", None)
+    broadcast_state_sync()
+
+    build_thread = threading.Thread(
+        target=_run_engineering_worker,
+        args=(project_id, build_id),
+        daemon=True,
+    )
+    build_thread.start()
+
+    return JSONResponse({
+        "status": "CONFIRMED",
+        "message": "Interpretation confirmed. Build commenced.",
+        "interpretation": getattr(state, "requirement_interpretation", ""),
+    })
+
+
+async def api_post_reject(request):
+    """Reject or modify the requirement interpretation with user feedback."""
+    data = await request.json()
+    feedback = (data.get("feedback") or "").strip()
+    with state_lock:
+        raw_spec = state.engineering_spec or {}
+        spec = EngineeringSpecification.from_dict(raw_spec)
+        revised = SemanticRequirementAnalyzer.update_with_feedback(spec, feedback, is_rejection=True)
+        state.engineering_spec = revised.to_dict()
+        state.requirement_interpretation = revised.concise_interpretation
+        state.interpretation_status = "PENDING"
+        state.goal = f"{state.goal} (Updated: {feedback})"
+        state.add_activity(f"Interpretation revised based on feedback: '{feedback}'", level="ok")
+        state.transition_to("AWAITING_CONFIRMATION", f"Revised interpretation pending confirmation: {revised.concise_interpretation}")
+    broadcast_state_sync()
+
+    return JSONResponse({
+        "status": "REVISED",
+        "message": "Interpretation revised. Awaiting confirmation.",
+        "interpretation": state.requirement_interpretation,
+        "engineering_spec": state.engineering_spec,
+    })
 
 
 async def api_get_files(request):
@@ -791,8 +1033,31 @@ async def websocket_endpoint(websocket: WebSocket):
                     goal = (data.get("goal") or "").strip()
                     lang = data.get("language", "Auto Detect")
                     if goal and not state.is_running:
+                        target_pid = f"proj_{int(time.time())}_{uuid.uuid4().hex[:4]}"
+                        build_id = f"bld_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+                        active_ctx = ActiveProjectContext.create_new(
+                            project_name="SPIDY Project",
+                            project_id=target_pid,
+                            build_id=build_id,
+                        )
+                        set_active_context(active_ctx)
+                        project_ws = WorkspaceManager.for_project(target_pid)
+                        runner.workspace = project_ws
+                        pipeline.workspace = project_ws
+                        with state_lock:
+                            state.reset(new_goal=goal, language=lang, project_id=target_pid, build_id=build_id)
+                            state.auto_confirm = False
+                            state.conversation_id = active_ctx.conversation_id
+                            state.active_context = active_ctx
+                            state.db_manager = db_manager
+                            state.build_start_time = time.time()
+                            state.project_state = "UNDERSTANDING"
+                            state.interpretation_status = "PENDING"
+                            state.user_approved = False
+                            state.is_running = True
+                        broadcast_state_sync()
                         threading.Thread(
-                            target=_run_build_worker, args=(goal, lang), daemon=True
+                            target=_run_understanding_worker, args=(goal, lang, target_pid, build_id), daemon=True
                         ).start()
                 elif action == "STOP":
                     with state_lock:
@@ -958,6 +1223,8 @@ routes = [
     Route("/api/chat", api_post_chat, methods=["POST"]),
     Route("/api/stop", api_post_stop, methods=["POST"]),
     Route("/api/approve", api_post_approve, methods=["POST"]),
+    Route("/api/confirm", api_post_confirm, methods=["POST"]),
+    Route("/api/reject", api_post_reject, methods=["POST"]),
     Route("/api/files", api_get_files, methods=["GET"]),
     Route("/api/diagnostics", api_get_diagnostics, methods=["GET"]),
     Route("/api/history", api_get_history, methods=["GET"]),

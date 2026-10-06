@@ -7,7 +7,9 @@ generation gates, active agent, progress calculation, and verification.
 from dataclasses import dataclass, field
 import datetime
 import time
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
+
+from backend.core.failure_fingerprint import FailureTracker, FailureFingerprint
 
 
 @dataclass
@@ -29,6 +31,10 @@ class Task:
     is_required: bool = True
     build_id: str = ""
     project_id: str = ""
+    description: str = ""
+    expected_output: str = ""
+    evidence_required: str = ""
+    evidence_collected: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         return {
@@ -49,6 +55,10 @@ class Task:
             "is_required": self.is_required,
             "build_id": self.build_id,
             "project_id": self.project_id,
+            "description": self.description,
+            "expected_output": self.expected_output,
+            "evidence_required": self.evidence_required,
+            "evidence_collected": self.evidence_collected,
         }
 
     @classmethod
@@ -86,6 +96,10 @@ PHASES = [
 
 PROJECT_STATES = [
     "INTAKE",
+    "UNDERSTANDING",
+    "AWAITING_CONFIRMATION",
+    "CONFIRMED",
+    "ENGINEERING_READY",
     "CLARIFYING",
     "PLANNING",
     "ARCHITECTING",
@@ -151,6 +165,16 @@ class ProjectState:
         self.clarification_answers: Dict[str, str] = {}
         self.user_approved: bool = False
 
+        # Semantic requirement understanding and user confirmation
+        self.engineering_spec: Optional[Dict[str, Any]] = None
+        self.requirement_interpretation: Optional[str] = None
+        self.interpretation_status: str = "PENDING"  # "PENDING", "CONFIRMED", "REJECTED"
+        self.auto_confirm: bool = False
+        self.pending_intent: str = "NEW_PROJECT"  # "NEW_PROJECT" or "MODIFICATION"
+        self.pending_target_project_id: Optional[str] = None
+        self.pending_requirement: Optional[str] = None
+        self.pending_confirmation_id: Optional[str] = None
+
         # Lifecycle state machine & Phase
         self.current_phase: str = "DISCOVER"
         self.project_state: str = "INTAKE"
@@ -170,6 +194,8 @@ class ProjectState:
         self.is_project_generated: bool = False
         self.failure_type: Optional[str] = None  # PRECONDITION_FAILURE, AGENT_FAILURE, PROJECT_GENERATION_FAILURE, RUNTIME_FAILURE, TEST_FAILURE, USER_INPUT_REQUIRED
         self.recovery_attempts: int = 0
+        self.failure_tracker: FailureTracker = FailureTracker(loop_threshold=2)
+        self.waiting_for_user_reason: Optional[str] = None
 
         # Runtime & Live Preview tracking
         self.project_type: str = "General Software Project"
@@ -251,8 +277,126 @@ class ProjectState:
             "total": total,
         }
 
+    def is_awaiting_confirmation(self) -> bool:
+        """Check if project is currently gated awaiting user confirmation of the requirement."""
+        if getattr(self, "auto_confirm", False):
+            return False
+        if self.project_state == "AWAITING_CONFIRMATION":
+            return True
+        if self.project_state == "UNDERSTANDING":
+            return True
+        if self.interpretation_status == "PENDING" and (self.engineering_spec or self.requirement_interpretation):
+            return True
+        return False
+
+    def can_execute_engineering(self) -> bool:
+        """Verify whether engineering execution tasks (planning, code generation, runtime, test) are allowed."""
+        if getattr(self, "auto_confirm", False):
+            return self.project_state not in ("FAILED", "BLOCKED", "WAITING_FOR_USER")
+        if self.is_awaiting_confirmation():
+            return False
+        if self.project_state in ("UNDERSTANDING", "AWAITING_CONFIRMATION", "FAILED", "BLOCKED", "WAITING_FOR_USER"):
+            return False
+        if self.interpretation_status == "PENDING" and (self.engineering_spec or self.requirement_interpretation):
+            return False
+        return True
+
+    def release_task_graph(self) -> None:
+        """Release tasks from PENDING_CONFIRMATION to QUEUED upon user confirmation."""
+        for t in self.tasks:
+            if t.status == "PENDING_CONFIRMATION":
+                t.status = "QUEUED"
+
+    def wait_for_user(self, reason: str = "") -> None:
+        """Place project in WAITING_FOR_USER state requiring human clarification or input."""
+        self.waiting_for_user_reason = reason
+        self.active_agent_status = "WAITING"
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.state_transition_history.append({"from": self.project_state, "to": "WAITING_FOR_USER", "reason": reason, "time": ts})
+        self.project_state = "WAITING_FOR_USER"
+        self.add_activity(f"Execution paused waiting for user input: {reason}", level="run")
+
+    def release_from_user(self, next_state: str = "ENGINEERING_READY") -> bool:
+        """Release project from WAITING_FOR_USER state after human input is provided."""
+        self.waiting_for_user_reason = None
+        self.active_agent_status = "READY"
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.state_transition_history.append({"from": self.project_state, "to": next_state, "reason": "User input received", "time": ts})
+        self.project_state = next_state
+        self.add_activity(f"Resuming execution from user wait -> {next_state}", level="ok")
+        return True
+
+    def record_failure(
+        self,
+        operation: str,
+        failure_type: str,
+        target: str,
+        error_message: str,
+        phase: Optional[str] = None,
+    ) -> bool:
+        """Record failure in the failure tracker and check if an identical loop is detected."""
+        if not hasattr(self, "failure_tracker"):
+            self.failure_tracker = FailureTracker(loop_threshold=2)
+        is_loop = self.failure_tracker.record_failure(operation, failure_type, target, error_message, phase)
+        if is_loop:
+            self.add_activity(
+                f"Repeated identical failure detected on {operation}:{target} ({failure_type}). Halting autonomous retries.",
+                level="bad",
+            )
+        return is_loop
+
+    def record_success(self, operation: str, target: str = "") -> None:
+        """Record successful operation in failure tracker."""
+        if hasattr(self, "failure_tracker"):
+            self.failure_tracker.record_success(operation, target)
+
     def transition_to(self, new_state: str, reason: str = "") -> bool:
         """Validate and apply a lifecycle state transition."""
+        engineering_states = (
+            "PLANNING",
+            "ARCHITECTING",
+            "BUILDING",
+            "GENERATING",
+            "RUNNING",
+            "TESTING",
+            "DEBUGGING",
+            "REVIEWING",
+            "DOCUMENTING",
+            "VERIFYING",
+        )
+        # Prohibit invalid transitions from AWAITING_CONFIRMATION directly to engineering execution states
+        if self.project_state == "AWAITING_CONFIRMATION" and new_state in engineering_states:
+            self.add_activity(
+                f"Invalid state transition rejected: {self.project_state} -> {new_state}. "
+                "Engineering execution cannot begin before requirement interpretation is CONFIRMED.",
+                level="bad",
+            )
+            return False
+
+        # Prohibit invalid transitions from WAITING_FOR_USER to engineering states without user release
+        if self.project_state == "WAITING_FOR_USER" and new_state in engineering_states:
+            self.add_activity(
+                f"Invalid state transition rejected: {self.project_state} -> {new_state}. "
+                "Cannot resume engineering execution without explicit user response/release.",
+                level="bad",
+            )
+            return False
+
+        # Prohibit illegal transition FAILED -> SUCCESS directly without recovery
+        if self.project_state == "FAILED" and new_state == "SUCCESS":
+            self.add_activity("Illegal state transition rejected: FAILED -> SUCCESS directly without recovery/verification.", level="bad")
+            return False
+
+        # Prohibit transition to SUCCESS if required tasks have failed
+        if new_state == "SUCCESS" and self.has_failed_required_tasks():
+            self.add_activity("Illegal state transition rejected: Cannot transition to SUCCESS when required tasks have failed.", level="bad")
+            return False
+
+        # Prohibit transition to SUCCESS if failure reason is still active
+        if new_state == "SUCCESS" and self.failure_reason:
+            self.add_activity("Illegal state transition rejected: Cannot transition to SUCCESS while unresolved failure reason exists.", level="bad")
+            return False
+
         # Prohibit invalid transitions
         if self.project_state in ("PLANNING", "ARCHITECTING", "INTAKE") and new_state in ("DEBUGGING", "TESTING", "RUNNING"):
             self.add_activity(f"Invalid state transition rejected: {self.project_state} -> {new_state}. Prerequisites missing.", level="bad")
@@ -268,7 +412,11 @@ class ProjectState:
         return True
 
     def is_task_ready(self, task: Task) -> bool:
-        """Verify that all prerequisite task dependencies have succeeded."""
+        """Verify that all prerequisite task dependencies have succeeded and confirmation gate is open."""
+        if self.is_awaiting_confirmation():
+            return False
+        if task.status in ("PENDING_CONFIRMATION", "BLOCKED"):
+            return False
         if not task.dependencies:
             return True
         completed_ids = {t.id for t in self.tasks if t.status in ("SUCCESS", "completed")}
@@ -289,6 +437,10 @@ class ProjectState:
         is_required: bool = True,
         build_id: Optional[str] = None,
         project_id: Optional[str] = None,
+        description: str = "",
+        expected_output: str = "",
+        evidence_required: str = "",
+        evidence_collected: Optional[Dict[str, Any]] = None,
     ) -> None:
         bid = build_id or getattr(self, "build_id", "")
         pid = project_id or getattr(self, "project_id", "")
@@ -304,15 +456,20 @@ class ProjectState:
                 is_required=is_required,
                 build_id=bid,
                 project_id=pid,
+                description=description,
+                expected_output=expected_output,
+                evidence_required=evidence_required,
+                evidence_collected=evidence_collected,
             )
         )
 
-    def has_failed_required_tasks(self) -> bool:
+    def has_failed_required_tasks(self, phase: Optional[str] = None) -> bool:
         """Check if any task marked as required in the current build has failed."""
         current_build = getattr(self, "build_id", None)
         return any(
-            t.status == "FAILED"
+            t.status in ("FAILED", "RECOVERING", "RETRYING")
             and getattr(t, "is_required", True)
+            and (phase is None or t.phase == phase)
             and (not current_build or not getattr(t, "build_id", None) or t.build_id == current_build)
             for t in self.tasks
         )
@@ -490,6 +647,14 @@ class ProjectState:
             "clarifying_questions": self.clarifying_questions,
             "clarification_answers": self.clarification_answers,
             "user_approved": self.user_approved,
+            "engineering_spec": self.engineering_spec.to_dict() if hasattr(getattr(self, "engineering_spec", None), "to_dict") else getattr(self, "engineering_spec", None),
+            "requirement_interpretation": getattr(self, "requirement_interpretation", None),
+            "interpretation_status": getattr(self, "interpretation_status", "PENDING"),
+            "auto_confirm": getattr(self, "auto_confirm", False),
+            "pending_intent": getattr(self, "pending_intent", "NEW_PROJECT"),
+            "pending_target_project_id": getattr(self, "pending_target_project_id", None),
+            "pending_requirement": getattr(self, "pending_requirement", None),
+            "pending_confirmation_id": getattr(self, "pending_confirmation_id", None),
             "current_phase": self.current_phase,
             "project_state": self.project_state,
             "active_agent": self.active_agent,
@@ -528,6 +693,8 @@ class ProjectState:
             "estimated_complexity": self.estimated_complexity,
             "estimated_confidence": self.estimated_confidence,
             "actual_duration_str": self.actual_duration_str,
+            "waiting_for_user_reason": getattr(self, "waiting_for_user_reason", None),
+            "failure_loop_detected": self.failure_tracker.is_loop_detected if hasattr(self, "failure_tracker") else False,
             "files_count": len(self.files),
             "files_list": list(self.files.keys()),
         }

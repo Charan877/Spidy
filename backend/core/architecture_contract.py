@@ -106,9 +106,20 @@ class ArchitectureContract:
         return "\n".join(lines)
 
 
-def _detect_resource_name(goal: str) -> Tuple[str, str, Dict[str, Any]]:
-    """Derive representative CRUD resource name, endpoint, and test payload from requirement."""
-    goal_lower = goal.lower()
+def _detect_resource_name(goal: str, plan_data: Optional[Dict[str, Any]] = None) -> Tuple[str, str, Dict[str, Any]]:
+    """Derive representative CRUD resource name, endpoint, and test payload from requirement or plan."""
+    plan_data = plan_data or {}
+    
+    # 1. Use explicit plan_data resource if provided
+    if plan_data.get("crud_resource_name") and plan_data.get("test_crud_endpoint"):
+        res = plan_data["crud_resource_name"].lower()
+        ep = plan_data["test_crud_endpoint"]
+        payload = plan_data.get("test_crud_payload") or {"title": f"Sample {res.capitalize()}", "description": "Automated test item"}
+        return res, ep, payload
+
+    goal_lower = (goal or "").lower()
+
+    # 2. Known domain mappings (preserving regression compatibility)
     if "spend" in goal_lower or "expense" in goal_lower or "budget" in goal_lower:
         return "expense", "/api/expenses", {"title": "Office Supplies", "amount": 42.50, "category": "Work"}
     elif "task" in goal_lower or "todo" in goal_lower or "focus" in goal_lower:
@@ -119,6 +130,36 @@ def _detect_resource_name(goal: str) -> Tuple[str, str, Dict[str, Any]]:
         return "product", "/api/products", {"name": "Mechanical Keyboard", "price": 99.00}
     elif "habit" in goal_lower:
         return "habit", "/api/habits", {"title": "Morning Run", "frequency": "daily"}
+    elif "recipe" in goal_lower or "dish" in goal_lower or "cook" in goal_lower:
+        return "recipe", "/api/recipes", {"title": "Pasta Carbonara", "prep_time": 20, "category": "Italian"}
+    elif "sensor" in goal_lower or "telemetry" in goal_lower or "iot" in goal_lower:
+        return "reading", "/api/readings", {"sensor_id": "temp-01", "value": 24.5, "unit": "Celsius"}
+    elif "book" in goal_lower or "library" in goal_lower:
+        return "book", "/api/books", {"title": "Clean Code", "author": "Robert C. Martin", "year": 2008}
+    elif "student" in goal_lower or "grade" in goal_lower or "school" in goal_lower:
+        return "student", "/api/students", {"name": "Alex Smith", "grade": "A", "course": "CS101"}
+    elif "note" in goal_lower or "memo" in goal_lower:
+        return "note", "/api/notes", {"title": "Project Notes", "content": "Key architecture decisions"}
+    elif "workout" in goal_lower or "fitness" in goal_lower:
+        return "workout", "/api/workouts", {"title": "Cardio Session", "duration_minutes": 45}
+    elif "bookmark" in goal_lower or "link" in goal_lower:
+        return "bookmark", "/api/bookmarks", {"title": "Dev Docs", "url": "https://developer.mozilla.org"}
+
+    # 3. Dynamic regex extraction of entity nouns from requirement
+    patterns = [
+        r'(?:tracking|track|manage|managing|storing|store|sharing|share|collecting|collect)\s+(?:a\s+|an\s+|the\s+)?([a-zA-Z]{3,15})',
+        r'([a-zA-Z]{3,15})\s+(?:tracker|management|manager|system|service|registry|portal|app)',
+    ]
+    stopwords = {"web", "application", "fullstack", "full", "stack", "frontend", "backend", "fastapi", "react", "database", "sqlite", "personal", "simple", "modern"}
+    
+    for pat in patterns:
+        m = re.search(pat, goal, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).lower().rstrip("s")
+            if candidate not in stopwords and len(candidate) > 2:
+                plural = candidate + "es" if candidate.endswith(("s", "x", "z", "ch", "sh")) else candidate + "s"
+                return candidate, f"/api/{plural}", {"title": f"Sample {candidate.capitalize()}", "description": f"Automated test {candidate}"}
+
     return "item", "/api/items", {"title": "Sample Record", "description": "Automated test item"}
 
 
@@ -134,7 +175,7 @@ def extract_architecture_contract(
     # Extract or infer project name
     project_name = plan_data.get("project_name")
     if not project_name or project_name in ("SPIDY Project", "SPIDY Application"):
-        name_match = re.search(r'called\s+["\']?([^"\'\s,.]+)["\']?', requirement, re.IGNORECASE)
+        name_match = re.search(r'(?:called|named|titled)\s+["\']?([^"\'\s,.]+)["\']?', requirement, re.IGNORECASE)
         if name_match:
             project_name = name_match.group(1).strip()
         elif "spendwise" in req_lower:
@@ -144,7 +185,12 @@ def extract_architecture_contract(
         elif "taskflow" in req_lower:
             project_name = "TaskFlow"
         else:
-            project_name = "SPIDY Application"
+            # Check for a capitalized project name in quotes or preceded by 'app'/'platform'
+            quoted = re.search(r'["\']([A-Z][a-zA-Z0-9_\s]{2,25})["\']', requirement)
+            if quoted:
+                project_name = quoted.group(1).strip()
+            else:
+                project_name = "SPIDY Application"
 
     # Analyze frontend requirements
     has_react = "react" in req_lower
@@ -156,6 +202,18 @@ def extract_architecture_contract(
 
     web_signals = ["web", "html", "react", "vue", "svelte", "frontend", "dashboard"]
     has_web_intent = any(w in req_lower for w in web_signals) or bool(re.search(r"\bui\b", req_lower))
+
+    # Check if this is an explicit fullstack project vs a pure backend API service
+    is_explicit_fullstack = (
+        any(w in req_lower for w in ["full-stack", "fullstack"])
+        or selected_language == "Fullstack"
+        or plan_data.get("is_fullstack", False)
+    )
+    is_pure_backend_api = (
+        ("fastapi" in req_lower or "flask" in req_lower or "express" in req_lower or "api" in req_lower or "service" in req_lower)
+        and not has_web_intent
+        and not is_explicit_fullstack
+    )
 
     if has_next:
         fe_framework = "Next.js"
@@ -177,7 +235,7 @@ def extract_architecture_contract(
         fe_lang = "TypeScript" if has_ts else "JavaScript"
         fe_tooling = "Vite"
         fe_entry = "src/main.ts" if fe_lang == "TypeScript" else "src/main.js"
-    elif ("cli" in req_lower or "command line" in req_lower or "terminal" in req_lower) and not has_web_intent:
+    elif (("cli" in req_lower or "command line" in req_lower or "terminal" in req_lower) and not has_web_intent) or is_pure_backend_api:
         fe_framework = "None"
         fe_lang = "None"
         fe_tooling = "None"
@@ -274,7 +332,7 @@ def extract_architecture_contract(
         comm_protocol = "None"
 
     # Derive CRUD details
-    res_name, crud_endpoint, crud_payload = _detect_resource_name(requirement)
+    res_name, crud_endpoint, crud_payload = _detect_resource_name(requirement, plan_data=plan_data)
 
     # Build required layers list
     required_layers = []

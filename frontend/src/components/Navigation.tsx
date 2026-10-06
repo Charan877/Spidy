@@ -5,15 +5,26 @@ interface NavigationProps {
   state: ProjectStateSnapshot;
   activeDrawer: string | null;
   onToggleDrawer: (drawer: string | null) => void;
+  currentStage?: string;
 }
 
 export const Navigation: React.FC<NavigationProps> = ({
   state,
   activeDrawer,
   onToggleDrawer,
+  currentStage,
 }) => {
   const getStatusLabel = () => {
-    if (state.current_phase === 'COMPLETE' && state.project_success) return 'VERIFIED';
+    if (state.is_running) {
+      if (state.current_phase === 'PLAN') return 'PLANNING';
+      if (state.current_phase === 'ARCHITECT') return 'ARCHITECTING';
+      if (state.current_phase === 'BUILD') return 'BUILDING';
+      if (state.current_phase === 'RUN') return 'RUNNING';
+      if (state.current_phase === 'TEST') return 'TESTING';
+      if (state.current_phase === 'DEBUG') return 'REPAIRING';
+      if (state.current_phase === 'REVIEW') return 'VERIFYING';
+      return state.current_phase || 'RUNNING';
+    }
     if (state.current_phase === 'FAILED') {
       const isInterrupted = ['EXECUTION_INTERRUPTED', 'SERVER_RESTARTED_MID_BUILD', 'USER_CANCELLED'].includes(
         state.failure_classification || ''
@@ -21,22 +32,24 @@ export const Navigation: React.FC<NavigationProps> = ({
       return isInterrupted ? 'INTERRUPTED' : 'FAILED';
     }
     if (state.current_phase === 'BLOCKED') return 'BLOCKED';
-    if (!state.is_running) return 'READY';
-    if (state.current_phase === 'PLAN') return 'PLANNING';
-    if (state.current_phase === 'ARCHITECT') return 'ARCHITECTING';
-    if (state.current_phase === 'BUILD') return 'BUILDING';
-    if (state.current_phase === 'RUN') return 'RUNNING';
-    if (state.current_phase === 'TEST') return 'TESTING';
-    if (state.current_phase === 'DEBUG') return 'REPAIRING';
-    if (state.current_phase === 'REVIEW') return 'VERIFYING';
-    return state.current_phase || 'READY';
+
+    if (currentStage) {
+      if (currentStage === 'RESULT') {
+        return (state.current_phase === 'COMPLETE' && state.project_success) ? 'VERIFIED' : 'RESULT';
+      }
+      return currentStage;
+    }
+
+    if (state.current_phase === 'COMPLETE' && state.project_success) return 'VERIFIED';
+    return 'READY';
   };
 
   const getStatusColor = () => {
     const s = getStatusLabel();
     if (s === 'VERIFIED' || s === 'RUNNING') return 'bg-emerald-400';
-    if (['BUILDING', 'PLANNING', 'ARCHITECTING'].includes(s)) return 'bg-sky-400';
-    if (s === 'REPAIRING') return 'bg-amber-400';
+    if (['BUILDING', 'PLANNING', 'ARCHITECTING', 'UNDERSTAND', 'PLAN', 'BUILD'].includes(s)) return 'bg-sky-400';
+    if (['TESTING', 'TEST', 'VERIFY'].includes(s)) return 'bg-teal-400';
+    if (['REPAIRING', 'RECOVER'].includes(s)) return 'bg-amber-400';
     if (s === 'INTERRUPTED' || s === 'FAILED' || s === 'BLOCKED') return 'bg-rose-400';
     return 'bg-slate-400';
   };

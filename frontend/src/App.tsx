@@ -75,7 +75,7 @@ export const App: React.FC = () => {
       return {
         ...INITIAL_STATE,
         current_phase: qPhase,
-        project_state: qPhase === 'COMPLETE' ? 'FINISHED' : (qPhase === 'DISCOVER' ? 'IDLE' : 'RUNNING'),
+        project_state: qPhase === 'COMPLETE' ? 'SUCCESS' : (qPhase === 'DISCOVER' ? 'IDLE' : 'RUNNING'),
         is_running: !['DISCOVER', 'COMPLETE', 'FAILED'].includes(qPhase),
         project_success: qPhase === 'COMPLETE',
         is_app_verified: qPhase === 'COMPLETE',
@@ -97,6 +97,13 @@ export const App: React.FC = () => {
 
   const [activeDrawer, setActiveDrawer] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+
+  // Track whether a build was actually initiated or active in the current session (prevents stale history on startup)
+  const [hasSessionBuildStarted, setHasSessionBuildStarted] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    const params = new URLSearchParams(window.location.search);
+    return params.has('phase') || params.has('build');
+  });
 
   // Synchronously initialize scrollProgress from ?scroll= if provided
   const [scrollProgress, setScrollProgress] = useState<number>(() => {
@@ -122,8 +129,12 @@ export const App: React.FC = () => {
     };
 
     window.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('resize', handleScroll, { passive: true });
     handleScroll();
-    return () => window.removeEventListener('scroll', handleScroll);
+    return () => {
+      window.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('resize', handleScroll);
+    };
   }, []);
 
   // Connect to backend WebSocket
@@ -146,7 +157,9 @@ export const App: React.FC = () => {
           if (data.type === 'STATE_UPDATE' && data.state) {
             if (!hasQueryPhase) {
               setState(data.state);
-              if (!data.state.is_running) {
+              if (data.state.is_running) {
+                setHasSessionBuildStarted(true);
+              } else {
                 setIsLoading(false);
               }
             }
@@ -171,7 +184,9 @@ export const App: React.FC = () => {
         .then((data) => {
           if (data && data.project_state) {
             setState(data);
-            if (!data.is_running) {
+            if (data.is_running) {
+              setHasSessionBuildStarted(true);
+            } else {
               setIsLoading(false);
             }
           }
@@ -188,6 +203,7 @@ export const App: React.FC = () => {
 
   const handleStartBuild = async (goal: string, language: string) => {
     setIsLoading(true);
+    setHasSessionBuildStarted(true);
     try {
       const res = await fetch('/api/build', {
         method: 'POST',
@@ -207,6 +223,7 @@ export const App: React.FC = () => {
 
   const handleSendMessage = async (message: string) => {
     setIsLoading(true);
+    setHasSessionBuildStarted(true);
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -234,6 +251,7 @@ export const App: React.FC = () => {
     try {
       await fetch('/api/stop', { method: 'POST' });
       setActiveDrawer(null);
+      setHasSessionBuildStarted(false);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch {}
   };
@@ -244,20 +262,49 @@ export const App: React.FC = () => {
     window.scrollTo({ top: targetY, behavior: 'smooth' });
   };
 
-  // State conditions: Authoritative Completion Gate
-  const isInterrupted =
-    ['FAILED', 'BLOCKED'].includes(state.current_phase) ||
-    ['FAILED', 'BLOCKED'].includes(state.project_state) ||
-    ['FAILED', 'BLOCKED'].includes(state.runtime_status) ||
-    Boolean(state.has_failed_required_tasks && state.current_phase !== 'BUILD' && state.current_phase !== 'DISCOVER');
+  // Single authoritative lifecycle model: 8 stages derived continuously from scrollProgress
+  const activeStageIndex = Math.min(7, Math.max(0, Math.round(scrollProgress * 7)));
+  const LIFECYCLE_STAGES = [
+    'INTRO',
+    'UNDERSTAND',
+    'PLAN',
+    'BUILD',
+    'TEST',
+    'RECOVER',
+    'VERIFY',
+    'RESULT',
+  ] as const;
+  const currentStage = LIFECYCLE_STAGES[activeStageIndex];
+  const isAtResultStage = activeStageIndex === 7;
 
-  const isSuccess =
-    !isInterrupted &&
+  // State conditions: Authoritative Completion Gate
+  const isFailureOrBlocked =
+    hasSessionBuildStarted &&
+    (['FAILED', 'BLOCKED'].includes(state.current_phase) ||
+      ['FAILED', 'BLOCKED'].includes(state.project_state) ||
+      ['FAILED', 'BLOCKED'].includes(state.runtime_status) ||
+      Boolean(state.has_failed_required_tasks && state.current_phase !== 'BUILD' && state.current_phase !== 'DISCOVER'));
+
+  const isLegitimateSuccess =
+    hasSessionBuildStarted &&
+    !isFailureOrBlocked &&
     state.current_phase === 'COMPLETE' &&
-    state.project_state === 'SUCCESS' &&
+    ['SUCCESS', 'FINISHED'].includes(state.project_state) &&
     state.project_success &&
     !state.has_failed_required_tasks &&
     (!state.is_web_project || state.is_app_verified);
+
+  // Result presentation is displayed ONLY when lifecycle is at RESULT stage AND build is legitimately verified
+  const showResultPanel = isAtResultStage && isLegitimateSuccess;
+
+  // Auto-scroll to Result stage upon successful completion of a session build
+  const wasRunningRef = useRef(false);
+  useEffect(() => {
+    if (wasRunningRef.current && !state.is_running && isLegitimateSuccess) {
+      handleScrollToSection(7);
+    }
+    wasRunningRef.current = state.is_running;
+  }, [state.is_running, isLegitimateSuccess]);
 
   const isActiveBuild =
     state.is_running &&
@@ -271,8 +318,8 @@ export const App: React.FC = () => {
       'REVIEW',
       'DOCUMENT',
     ].includes(state.current_phase) &&
-    !isSuccess &&
-    !isInterrupted;
+    !isLegitimateSuccess &&
+    !isFailureOrBlocked;
 
   return (
     <div className="relative min-h-screen bg-[#040711] text-white selection:bg-cyan-500/30">
@@ -288,6 +335,7 @@ export const App: React.FC = () => {
         state={state}
         activeDrawer={activeDrawer}
         onToggleDrawer={setActiveDrawer}
+        currentStage={currentStage}
       />
 
       {/* 3. SCROLL-DRIVEN 7-SECTION STORYTELLING OVERLAY */}
@@ -298,13 +346,14 @@ export const App: React.FC = () => {
         isLoading={isLoading}
         onScrollToSection={handleScrollToSection}
         onOpenWorkspace={() => setActiveDrawer('Workspace')}
+        isLegitimateSuccess={isLegitimateSuccess}
       />
 
       {/* 4. ACTIVE BUILD HUD (Floats above scene when build in progress) */}
       {isActiveBuild && <ActiveBuildHUD state={state} onStop={handleStop} />}
 
       {/* 5. SUCCESS CELEBRATION MODAL (If verified and at completion) */}
-      {isSuccess && (
+      {showResultPanel && (
         <SuccessView
           state={state}
           onOpenWorkspace={() => setActiveDrawer('Workspace')}
@@ -314,7 +363,7 @@ export const App: React.FC = () => {
       )}
 
       {/* 6. FAILURE / RECOVERY OVERLAY */}
-      {isInterrupted && (
+      {isFailureOrBlocked && (
         <FailureView
           state={state}
           onOpenDiagnostics={() => setActiveDrawer('Diagnostics')}
